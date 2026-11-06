@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $(uname -s) != Linux ]]; then
+  echo 'Linux sandbox verification requires Linux, Weston, and Xwayland. Native macOS verification must run separately.' >&2
+  exit 1
+fi
+
+missing=0
+for cmd in cargo hc weston Xwayland uv import magick setsid; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "Missing: $cmd" >&2
+    missing=1
+  fi
+done
+if (( missing )); then
+  exit 1
+fi
+
+if [[ ! -x scripts/sandbox ]]; then
+  echo 'Run this command from the repository root, with scripts/sandbox available.' >&2
+  exit 1
+fi
+
+echo 'Linux sandbox prerequisites found. This does not verify the quick terminal.'

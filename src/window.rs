@@ -811,6 +811,8 @@ impl AppWindow {
         }
         Self::note_core(&core);
         self.core = core.clone();
+        #[cfg(target_os = "macos")]
+        crate::quick_terminal::reconnected(core.clone(), cx);
         self.publish(cx);
         for t in self.terms.values() {
             t.view.update(cx, |v, cx| v.reattach(core.clone(), cx));
@@ -868,6 +870,11 @@ impl AppWindow {
             match loaded {
                 Ok(p) => {
                     self.person = p;
+                    #[cfg(target_os = "macos")]
+                    {
+                        crate::macos::update_quick_shortcut(&self.person, cx);
+                        crate::quick_terminal::set_height(self.person.quick_terminal_height, cx);
+                    }
                     let _ = std::fs::remove_file(file("settings.error"));
                 }
                 Err(e) => self.report("settings", &e),

@@ -714,6 +714,9 @@ What's about the user, never a look:
   Option input on every layout. `"left"` / `"right"` makes only that Option
   key act as Alt; the other types characters. Changes apply immediately, including layout
   switches. Linux and Windows are unchanged.
+- `quick_terminal_shortcut`: macOS only. Set an opt-in system-wide shortcut such as `"ctrl-alt-space"` to toggle the quick terminal; omit it or set it to `null` to disable it. Use `cmd`, `ctrl`, `alt`, or `shift` plus a letter, digit, `space`, or `backquote`. The key is a physical US keyboard position. Invalid shortcuts and conflicts with existing Carbon hotkeys show an error and leave the previous registration in place. Change the setting to retry a failed registration. Other shortcut mechanisms may not report conflicts. An exclusive Carbon registration can prevent later non-exclusive Carbon registrations from receiving that shortcut.
+  The quick terminal opens without a title bar at the top of the display. It temporarily requests Dock auto-hide while shown. It retains its core terminal across hide and show and reuses it on app restart. Its native window does not yet provide Herdr's terminal context menu or terminal-link peeks. Hiding it does not explicitly restore the previously focused application.
+- `quick_terminal_height`: macOS only. The fraction of the display height occupied by the quick terminal, from `0.1` to `1.0`. The default is `0.5`. For example, `0.75` uses three quarters of the display. A change takes effect the next time the quick terminal is shown.
 - `minimum_contrast`: terminal text contrast ratio, `1` (default) leaves
   program colors unchanged. Set it to `1.6` to enable the previous readability
   adjustment, or another number from `1` to `21`. Text below that ratio is

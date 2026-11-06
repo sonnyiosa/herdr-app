@@ -23,6 +23,13 @@ its terminals.
 `app.check_updates` checks for newer releases. Settings reports "Up to date"
 only after a successful check; on failure, check the connection and retry.
 
+On macOS, set `quick_terminal_shortcut` in settings.json to an opt-in
+system-wide shortcut such as `"ctrl-alt-space"` to toggle the quick terminal.
+Remove it or set it to null to disable it. The installed guide documents the
+supported keys and how registration failures are reported.
+Set `quick_terminal_height` to a display-height fraction from `0.1` to `1.0`;
+the default is `0.5`. Changes take effect the next time the terminal is shown.
+
 ## Show something when asked
 
 New spaces and tabs are shown immediately: only create them when asked.

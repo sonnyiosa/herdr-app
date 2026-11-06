@@ -373,6 +373,12 @@ pub struct Person {
     /// The herdr-core to use, when it isn't where Herdr looks (core_bin.rs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core: Option<String>,
+    /// Optional system-wide shortcut for the macOS quick terminal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quick_terminal_shortcut: Option<String>,
+    /// Height of the macOS quick terminal as a fraction of the display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quick_terminal_height: Option<f32>,
     /// Fonts for layouts that don't set their own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
@@ -448,6 +454,8 @@ impl Default for Person {
             zoom: 1.0,
             sounds: Sounds::default(),
             core: None,
+            quick_terminal_shortcut: None,
+            quick_terminal_height: None,
             font: None,
             font_size: None,
             font_ligatures: false,
@@ -668,8 +676,17 @@ pub fn load_person() -> Result<Person, String> {
     }
     let text = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
     let person: Person = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    validate_person(person)
+}
+
+fn validate_person(person: Person) -> Result<Person, String> {
     if !(ZOOM_MIN..=ZOOM_MAX).contains(&person.zoom) {
         return Err(format!("zoom {} is outside {ZOOM_MIN}..{ZOOM_MAX}", person.zoom));
+    }
+    if let Some(height) = person.quick_terminal_height
+        && !(0.1..=1.0).contains(&height)
+    {
+        return Err(format!("quick_terminal_height {height} is outside 0.1..1.0"));
     }
     Ok(person)
 }
@@ -843,6 +860,17 @@ pub const DEFAULT_FONT: &str = "JetBrains Mono";
 #[cfg(test)]
 mod tests {
     #[test]
+    fn quick_terminal_height_accepts_fractions_of_the_display() {
+        for value in ["{}", r#"{"quick_terminal_height":0.1}"#, r#"{"quick_terminal_height":0.75}"#, r#"{"quick_terminal_height":1.0}"#] {
+            let person = serde_json::from_str(value).unwrap();
+            assert!(super::validate_person(person).is_ok(), "{value}");
+        }
+        for value in [r#"{"quick_terminal_height":0.0}"#, r#"{"quick_terminal_height":1.1}"#] {
+            let person = serde_json::from_str(value).unwrap();
+            assert!(super::validate_person(person).unwrap_err().contains("quick_terminal_height"), "{value}");
+        }
+    }
+    #[test]
     fn terminal_ligatures_default_off_and_can_be_enabled() {
         use super::*;
         let person: Person = serde_json::from_str("{}").unwrap();
@@ -941,7 +969,7 @@ mod tests {
     /// settings.json key.
     #[test]
     fn the_guide_explains_every_setting() {
-        let all = Person { core: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
+        let all = Person { core: Some(String::new()), quick_terminal_shortcut: Some(String::new()), quick_terminal_height: Some(0.5), font: Some(String::new()), font_size: Some(1.0), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
         let keys: Vec<String> = serde_json::to_value(&all).unwrap().as_object().unwrap().keys().cloned().collect();
         let guide = include_str!("../defaults/AGENTS.md");
         let section = guide.split("## The person").nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default();

@@ -18,6 +18,8 @@ mod place;
 mod persist;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod quick_terminal;
 mod mods;
 mod mod_files;
 mod process_cwd;
@@ -199,6 +201,8 @@ fn main() {
 
 /// The main window, on a connected core.
 pub fn open_main(core: std::sync::Arc<hc::Core>, requests: async_channel::Receiver<mods::Request>, cx: &mut App) {
+            #[cfg(target_os = "macos")]
+            quick_terminal::init(core.clone(), cx);
             let (window_bounds, display_id) = place::initial(cx);
             let options = WindowOptions {
                 window_bounds: Some(window_bounds),
