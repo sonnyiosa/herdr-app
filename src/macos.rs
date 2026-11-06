@@ -63,7 +63,7 @@ impl Shortcut {
                     "1" => 18, "2" => 19, "3" => 20, "4" => 21, "6" => 22, "5" => 23,
                     "9" => 25, "7" => 26, "8" => 28, "0" => 29, "o" => 31,
                     "u" => 32, "i" => 34, "p" => 35, "l" => 37, "j" => 38,
-                    "k" => 40, "n" => 45, "m" => 46, "space" => 49, "backquote" => 50,
+                    "k" => 40, "\\" => 42, "n" => 45, "m" => 46, "space" => 49, "backquote" => 50,
                     _ => return Err("unknown shortcut key"),
                 });
             }
@@ -195,6 +195,7 @@ mod shortcut_tests {
     fn parses_quick_terminal_shortcuts() {
         assert_eq!(Shortcut::parse("ctrl-alt-space"), Ok(Shortcut { key: 49, modifiers: (1 << 12) | (1 << 11) }));
         assert_eq!(Shortcut::parse("cmd-shift-backquote"), Ok(Shortcut { key: 50, modifiers: (1 << 8) | (1 << 9) }));
+        assert_eq!(Shortcut::parse("cmd-\\"), Ok(Shortcut { key: 42, modifiers: 1 << 8 }));
         assert!(Shortcut::parse("space").is_err());
         assert!(Shortcut::parse("cmd-cmd-a").is_err());
         assert!(Shortcut::parse("cmd-a-b").is_err());

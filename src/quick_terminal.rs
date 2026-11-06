@@ -9,7 +9,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::{hc::Core, terminal::TerminalView};
+use crate::{hc::Core, terminal::{TerminalEvent, TerminalView}};
 
 const LABEL: &str = "herdr.quick-terminal";
 
@@ -38,10 +38,14 @@ struct QuickTerminal {
     visible: Rc<Cell<bool>>,
     dock_owned: Rc<Cell<bool>>,
     animation: Rc<native::Animation>,
+    _activation: Subscription,
+    terminal_subscription: Option<Subscription>,
+    starting: bool,
 }
 
 impl QuickTerminal {
     fn new(core: Arc<Core>, height: f32, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        native::make_borderless(window);
         let visible = Rc::new(Cell::new(true));
         let dock_owned = Rc::new(Cell::new(false));
         let animation = Rc::new(native::Animation::default());
@@ -53,12 +57,19 @@ impl QuickTerminal {
             native::set_visible(window, close_visible.clone(), close_dock_owned.clone(), close_animation.clone(), None, cx);
             false
         });
-        let mut quick = Self { core, height: Rc::new(Cell::new(height)), terminal: None, error: None, visible, dock_owned, animation };
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() && this.visible.replace(false) {
+                native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), None, cx);
+            }
+        });
+        let mut quick = Self { core, height: Rc::new(Cell::new(height)), terminal: None, error: None, visible, dock_owned, animation, _activation: activation, terminal_subscription: None, starting: false };
         quick.start(window, cx);
         quick
     }
 
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.starting { return; }
+        self.starting = true;
         self.error = None;
         let core = self.core.clone();
         let display = crate::terminal::initial_display(window);
@@ -71,16 +82,31 @@ impl QuickTerminal {
                     anyhow::bail!("terminal.list did not return terminals");
                 }
                 if let Some(address) = find_terminal(&list, &identity) { return Ok(address); }
-                run_core.run(vec![], None, json!({ (LABEL): identity }), None, Some((80, 24)), display)
+                run_core.run(vec![], Some(crate::mods::home().to_string_lossy().into_owned()), json!({ (LABEL): identity }), None, Some((80, 24)), display)
             }).await;
             let _ = this.update_in(cx, |this, window, cx| {
+                this.starting = false;
                 if !Arc::ptr_eq(&core, &this.core) {
                     this.start(window, cx);
                     return;
                 }
                 match result {
                     Ok(address) => {
-                        let terminal = cx.new(|cx| TerminalView::attach(this.core.clone(), address, (80, 24), cx));
+                        let terminal = cx.new(|cx| {
+                            let mut terminal = TerminalView::attach(this.core.clone(), address, (80, 24), cx);
+                            terminal.set_window_visibility(this.visible.clone());
+                            terminal
+                        });
+                        this.terminal_subscription = Some(cx.subscribe_in(&terminal, window, |this, _, event: &TerminalEvent, window, cx| {
+                            if matches!(event, TerminalEvent::Ended) {
+                                this.terminal = None;
+                                this.terminal_subscription = None;
+                                if this.visible.replace(false) {
+                                    native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), None, cx);
+                                }
+                                cx.notify();
+                            }
+                        }));
                         if native::visible(window) {
                             let focus = terminal.read(cx).focus_handle().clone();
                             focus.focus(window, cx);
@@ -160,7 +186,7 @@ pub fn toggle(cx: &mut App) {
                     .then(|| window.display(cx).map(|d| (f32::from(d.bounds().size.height) * height, height, this.height.clone())))
                     .flatten();
                 native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), pending, cx);
-                if this.error.is_some() {
+                if this.error.is_some() || this.terminal.is_none() {
                     this.start(window, cx);
                 }
                 if let Some(terminal) = &this.terminal {
@@ -266,19 +292,29 @@ mod native {
         unsafe { f(window, sel_registerName(c"isVisible".as_ptr())) }
     }
 
-    unsafe fn frame(window: *mut c_void) -> Rect {
-        let selector = unsafe { sel_registerName(c"frame".as_ptr()) };
+    pub fn make_borderless(window: &Window) {
+        let Some(window) = ns_window(window) else { return };
+        let set_style: unsafe extern "C" fn(*mut c_void, *const c_void, usize) = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
+        unsafe { set_style(window, sel_registerName(c"setStyleMask:".as_ptr()), 0); }
+    }
+
+    unsafe fn rect(object: *mut c_void, name: *const c_char) -> Rect {
+        let selector = unsafe { sel_registerName(name) };
         #[cfg(target_arch = "x86_64")]
         {
             let mut result = std::mem::MaybeUninit::<Rect>::uninit();
             let f: unsafe extern "C" fn(*mut Rect, *mut c_void, *const c_void) = unsafe { std::mem::transmute(objc_msgSend_stret as *const ()) };
-            unsafe { f(result.as_mut_ptr(), window, selector); result.assume_init() }
+            unsafe { f(result.as_mut_ptr(), object, selector); result.assume_init() }
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
             let f: unsafe extern "C" fn(*mut c_void, *const c_void) -> Rect = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-            unsafe { f(window, selector) }
+            unsafe { f(object, selector) }
         }
+    }
+
+    unsafe fn frame(window: *mut c_void) -> Rect {
+        unsafe { rect(window, c"frame".as_ptr()) }
     }
 
     unsafe fn set_frame(window: *mut c_void, frame: Rect, alpha: f64, animated: bool) {
@@ -319,6 +355,18 @@ mod native {
                     let get_options: unsafe extern "C" fn(*mut c_void, *const c_void) -> usize = std::mem::transmute(objc_msgSend as *const ());
                     let set_options: unsafe extern "C" fn(*mut c_void, *const c_void, usize) = std::mem::transmute(objc_msgSend as *const ());
                     let options = get_options(app, sel_registerName(c"presentationOptions".as_ptr()));
+                    if desired {
+                        let screen = send_id(window, b"screen\0");
+                        if !screen.is_null() && !dock_owned.get() {
+                            let screen_frame = rect(screen, c"frame".as_ptr());
+                            let visible_frame = rect(screen, c"visibleFrame".as_ptr());
+                            let inset = (visible_frame.origin.x - screen_frame.origin.x).max(0.0);
+                            let mut target = animation.frame.get().unwrap_or_else(|| frame(window));
+                            target.origin.x = screen_frame.origin.x + inset;
+                            target.size.width = (screen_frame.size.width - inset).max(1.0);
+                            animation.frame.set(Some(target));
+                        }
+                    }
                     if !animation.running.get() && (!desired || animation.frame.get().is_none()) {
                         animation.frame.set(Some(frame(window)));
                     }

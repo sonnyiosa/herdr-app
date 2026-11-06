@@ -1,0 +1,18 @@
+#!/bin/bash
+# Build the macOS release archive and a separate, unnotarized DMG.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+[[ $(uname -s) == Darwin && $(uname -m) == arm64 ]] || { echo 'package-dmg requires an Apple Silicon Mac' >&2; exit 1; }
+for tool in cargo zig create-dmg jq; do
+  command -v "$tool" >/dev/null || { echo "package-dmg: missing $tool" >&2; exit 1; }
+done
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+work=$(mktemp -d "${TMPDIR:-/tmp}/herdr-package-dmg.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-1.95.0} scripts/package
+tar -xzf dist/herdr-app-macos-aarch64.tar.gz -C "$work"
+out="dist/Herdr-${version}-$(date +%Y%m%d-%H%M%S)-$$.dmg"
+scripts/mac-dmg "$work/Herdr.app" "$out"
+echo "SHA-256: $(shasum -a 256 "$out")"

@@ -118,6 +118,10 @@ The platform installer builds a release and adds the app to your desktop.
 On Linux it links to this checkout, so keep the checkout in place.
 Quit and reopen Herdr to use the new build.
 
+On Apple Silicon macOS, run `scripts/package-dmg` to build a release archive and
+an unnotarized DMG in `dist/`. This needs Zig 0.16.0, Rust 1.95.0, `jq`, and
+`create-dmg` (`brew install zig create-dmg jq`). It does not install the app.
+
 Documentation checks also need [Bun](https://bun.sh): `just docs-check` checks generated pages and CLI examples; `just docs-generate` refreshes the reference pages.
 
 To compare drawing changes on Windows, Linux or macOS, run the same fixed workloads against each build:

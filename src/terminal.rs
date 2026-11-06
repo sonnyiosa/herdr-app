@@ -110,6 +110,7 @@ pub struct TerminalView {
     was_focused: bool,
     /// The window frame this terminal was last put on screen in (`FRAME`).
     shown_in: Cell<u64>,
+    window_visible: Option<Rc<Cell<bool>>>,
     /// When the person last typed here: output right after is shown at once.
     typed_at: Cell<Option<Instant>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
@@ -256,6 +257,7 @@ impl TerminalView {
             focus: cx.focus_handle(),
             was_focused: false,
             shown_in: Cell::new(0),
+            window_visible: None,
             typed_at: Cell::new(None),
             scrolled: point(0.0, 0.0),
             search_open: false,
@@ -481,7 +483,7 @@ impl TerminalView {
         // Output in a terminal nobody sees doesn't redraw the window; it's
         // drawn fresh when shown again. Nor does output that changed nothing
         // on screen (an agent spinning its title).
-        if self.shown_in.get() == FRAME.load(Ordering::Relaxed) && self.grid.borrow_mut().vt.shows_change() {
+        if self.on_screen_this_frame() && self.grid.borrow_mut().vt.shows_change() {
             self.redraw_soon(cx);
         }
         open
@@ -518,13 +520,17 @@ impl TerminalView {
         self.shown_in.set(FRAME.load(Ordering::Relaxed));
     }
 
+    pub fn set_window_visibility(&mut self, visible: Rc<Cell<bool>>) {
+        self.window_visible = Some(visible);
+    }
+
     /// Sizes a terminal that isn't on screen as its pane would be (`AppWindow::fit_hidden_tabs`).
     pub fn fit(&self, cols: u16, rows: u16, cell: Size<Pixels>, scale: f32) {
         self.grid.borrow_mut().fit(cols, rows, cell, scale);
     }
 
     pub fn on_screen_this_frame(&self) -> bool {
-        self.shown_in.get() == FRAME.load(Ordering::Relaxed)
+        self.window_visible.as_ref().map_or_else(|| self.shown_in.get() == FRAME.load(Ordering::Relaxed), |visible| visible.get())
     }
 
     fn send(&self, bytes: &[u8]) {
@@ -719,7 +725,7 @@ impl TerminalView {
                 if !this.search_open {
                     return None;
                 }
-                if this.shown_in.get() != FRAME.load(Ordering::Relaxed) {
+                if !this.on_screen_this_frame() {
                     return Some(Duration::from_millis(250));
                 }
                 if this.search_query.is_empty() {
@@ -885,7 +891,7 @@ impl TerminalView {
                 cx.background_executor().timer(Duration::from_millis(50)).await;
                 let keep = this.update(cx, |this, cx| {
                     if !this.selecting { return false; }
-                    if this.shown_in.get() != FRAME.load(Ordering::Relaxed) {
+                    if !this.on_screen_this_frame() {
                         this.finish_selection(None, cx);
                         return false;
                     }
@@ -2139,6 +2145,34 @@ impl Focusable for TerminalView {
 mod tests {
     use super::{ScrollTarget, pages_to_lines, scroll_target};
     use serde_json::{Value, json};
+
+    #[gpui::test]
+    fn separate_window_output_redraws_after_main_window_frame(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        use std::{cell::Cell, rc::Rc, time::Instant};
+
+        let visible = Rc::new(Cell::new(true));
+        let terminal = cx.new(|cx| {
+            let mut terminal = super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx);
+            terminal.set_window_visibility(visible.clone());
+            terminal.mark_shown();
+            terminal
+        });
+        let notifications = Rc::new(Cell::new(0));
+        let observed = notifications.clone();
+        let _subscription = cx.update(|app| app.observe(&terminal, move |_, _| observed.set(observed.get() + 1)));
+        super::next_frame();
+        cx.update(|app| terminal.update(app, |terminal, cx| {
+            terminal.typed_at.set(Some(Instant::now()));
+            terminal.ingest(vec![crate::hc::Stream::Data(b"typed".to_vec())], cx);
+        }));
+        assert_eq!(notifications.get(), 1, "visible terminal output must request a redraw");
+        visible.set(false);
+        cx.update(|app| terminal.update(app, |terminal, cx| {
+            terminal.ingest(vec![crate::hc::Stream::Data(b"hidden".to_vec())], cx);
+        }));
+        assert_eq!(notifications.get(), 1, "hidden terminal output must not request a redraw");
+    }
 
     #[gpui::test]
     fn terminal_release_ends_window_text_selection(cx: &mut gpui::TestAppContext) {
