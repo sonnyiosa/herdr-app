@@ -36,11 +36,8 @@ Core updates are handled separately by the core's updater.
 A checksum from the same service detects a damaged download; it is not an independent signature on the manifest.
 The app does not verify a separate cryptographic signature on update manifests.
 
-The release pipeline supports Apple Developer ID signing on macOS and Azure artifact signing on Windows when their credentials are configured.
-Without them, packages can be unsigned or ad hoc signed.
+The release pipeline ad hoc signs macOS apps. It does not notarize the app or DMG.
 On macOS the installer and updater verify certificate-signed bundles and preserve their signatures.
-Apple notarization is tested separately; it is not required for publishing a release.
-Do not assume every download is notarized or signed.
 
 ## Telemetry
 

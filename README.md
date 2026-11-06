@@ -4,18 +4,18 @@ Herdr is a desktop app for terminals and coding agents. Keep work in spaces, see
 
 ## Install
 
-### Linux and macOS
+### macOS
 
 ```sh
 curl -fsSL https://releases.herdr.dev/app/install.sh | sh
 ```
 
-Linux needs a desktop session and a working Vulkan driver. macOS builds are available for Apple Silicon; Intel Mac users can [build from source](#build-from-source). Linux builds are x86-64 and ARM64.
+Release builds are available for Apple Silicon. Intel Mac users can [build from source](#build-from-source).
 
 The installer adds Herdr to your apps and puts the command in `~/.local/bin`.
 Add that folder to your PATH if the installer asks.
 On macOS the app lives in `~/Applications/Herdr.app`.
-For drag-and-drop installation on Apple Silicon, download [Herdr.dmg](https://releases.herdr.dev/app/Herdr.dmg) and drag Herdr to Applications.
+For drag-and-drop installation on Apple Silicon, download [Herdr.dmg](https://releases.herdr.dev/app/Herdr.dmg) and drag Herdr to Applications. The app is not notarized, so macOS may block its first launch. If it does, open System Settings > Privacy & Security and use Open Anyway for Herdr.
 
 On macOS (Apple Silicon), you can also install with [Homebrew](https://brew.sh/):
 
@@ -23,19 +23,7 @@ On macOS (Apple Silicon), you can also install with [Homebrew](https://brew.sh/)
 brew install --cask herdr-app
 ```
 
-### Windows
-
-Run in PowerShell on x64 Windows with curl and tar installed (Windows 10 1803 or newer):
-
-```powershell
-irm https://releases.herdr.dev/app/install.ps1 | iex
-```
-
-Herdr appears in the Start menu. The installer adds `%LOCALAPPDATA%\Programs\herdr-app` to your user PATH. Open a new terminal to pick it up.
-
-The shell and PowerShell installers download and run code. Read the [shell installer](distribution/install.sh) or [PowerShell installer](distribution/install.ps1) first if you prefer.
-They also install [herdr-core](https://github.com/herdrdev/herdr-core) if it is missing.
-The app can help install or update a core it cannot use.
+The installer also installs [herdr-core](https://github.com/herdrdev/herdr-core) if it is missing. The app can help install or update a core it cannot use.
 
 ## Find your work
 
@@ -115,7 +103,7 @@ See the [command reference](docs/commands.md) for arguments.
 For bugs, mod API requests and code contributions, see [Contributing](CONTRIBUTING.md).
 
 Clone this repo with its submodules. Use Rust 1.95.0 and Zig 0.16.0, the versions used in [CI](.github/workflows/ci.yml).
-Linux needs the development packages listed in that workflow.
+Linux needs the development packages for GPUI and Vulkan.
 
 ```sh
 git clone --recurse-submodules https://github.com/herdrdev/herdr-app.git

@@ -6,7 +6,7 @@
 #
 # Linux: a folder holding herdr-app and the icon.
 # macOS: Herdr.app, signed with APPLE_CERTIFICATE_P12 when available,
-# otherwise ad hoc. The notarized DMG is a separate, non-blocking CI job.
+# otherwise ad hoc. The DMG is a separate CI job.
 # Windows (Git Bash): a folder holding herdr-app.exe and the icon.
 # Windows has curl and tar too, so the app updates the same way.
 # No core inside: the installer and the app install the core's own release
