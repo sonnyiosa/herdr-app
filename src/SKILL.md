@@ -85,6 +85,8 @@ the same tab. Give `direction` or `target`, not both. Focus stays with the same 
 herdr-app do pane.swap '{"pane":"p12","target":"p14"}'
 ```
 
+`terminal.copy_mode` starts keyboard copy mode in the focused terminal; the default key is `ctrl-f enter`. Move with `h/j/k/l` or arrows, `0/^/$`, `w/b/e` (uppercase for whitespace-separated words), `{`/`}`, `g/G`, Ctrl-U/D/B/F or Page Up/Down. `v` or Space selects characters; `V` selects lines. `/` and `?` search, `n/N` repeat, `y` or Enter copies and exits, and `q` exits. Escape clears selection or search before exiting.
+
 `terminal.search` opens a find bar in the focused terminal. It searches that
 terminal's screen and scrollback; Enter and Shift-Enter move between matches,
 Escape closes the bar while its find field has focus, and each terminal keeps its own query (reopening selects it, so typing replaces it).

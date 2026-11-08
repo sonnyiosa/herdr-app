@@ -2,6 +2,7 @@
 //! with GPUI, keys and mouse encoded by libghostty-vt and sent back.
 
 use crate::hc::{Core, Stream};
+use crate::copy_mode::{self, CopyMode, Direction, Motion, Prompt, Selection};
 use crate::vt::{self, CursorShape, Rgb, Select, Vt};
 use ghostty_sys::*;
 use gpui::prelude::FluentBuilder as _;
@@ -117,6 +118,7 @@ pub struct TerminalView {
     scrolled: Point<f32>,
     /// Search UI and query belong to this terminal view, not the window. Each
     /// terminal in a tab therefore keeps its own query and match position.
+    copy: Option<CopyMode>,
     search_open: bool,
     /// Restore the last keyboard target when returning to this pane.
     search_keys: bool,
@@ -260,6 +262,7 @@ impl TerminalView {
             window_visible: None,
             typed_at: Cell::new(None),
             scrolled: point(0.0, 0.0),
+            copy: None,
             search_open: false,
             search_keys: false,
             search_query: String::new(),
@@ -478,6 +481,7 @@ impl TerminalView {
             self.set_title(&title, cx);
         }
         if !open {
+            self.exit_copy_mode(cx);
             cx.emit(TerminalEvent::Ended);
         }
         // Output in a terminal nobody sees doesn't redraw the window; it's
@@ -534,6 +538,7 @@ impl TerminalView {
     }
 
     fn send(&self, bytes: &[u8]) {
+        if self.copy.is_some() { return; }
         self.typed_at.set(Some(Instant::now()));
         let mut g = self.grid.borrow_mut();
         if let Some(ch) = g.channel
@@ -591,6 +596,15 @@ impl TerminalView {
     /// Text as a paste; copied files (Finder, a clipboard manager's image) as
     /// if dropped; an image alone (a screenshot) as Ctrl+V pastes it.
     pub fn paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(copy) = &mut self.copy {
+            if let Some(prompt) = &mut copy.prompt
+                && let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+            {
+                prompt.query.push_str(&text);
+                cx.notify();
+            }
+            return;
+        }
         let Some(item) = cx.read_from_clipboard() else { return };
         if let Some(paths) = copied_files(&item) {
             self.dropped(paths, cx);
@@ -604,6 +618,7 @@ impl TerminalView {
 
     /// Ctrl+V: a remote image, clipboard text on Windows, or the key itself.
     pub fn paste_image(&mut self, cx: &mut Context<Self>) {
+        if self.copy.is_some() { return; }
         if self.send_image(cx) {
             return;
         }
@@ -647,6 +662,7 @@ impl TerminalView {
     /// Opens the find bar inside this terminal view. Keeping the input entity
     /// here means its query and selection survive tab switches independently.
     pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.exit_copy_mode(cx);
         let reopening = !self.search_open;
         let input = if let Some(input) = self.search_input.clone() {
             input
@@ -751,7 +767,190 @@ impl TerminalView {
         }));
     }
 
+    pub fn enter_copy_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.copy.is_some() { return; }
+        if self.search_open { self.close_search(window, cx); }
+        let mut g = self.grid.borrow_mut();
+        g.vt.clear_selection();
+        let point = g.vt.cursor_point().unwrap_or(vt::Point { row: g.vt.viewport_top() + u32::from(g.vt.rows.saturating_sub(1)), col: 0 });
+        let Some(cursor) = g.vt.track_point(point) else { return };
+        self.copy = Some(CopyMode { cursor, selection: None, prompt: None, last_search: None, entry_offset: g.vt.scrollbar().offset as usize, pending_search: false, current_match: None });
+        drop(g);
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn exit_copy_mode(&mut self, cx: &mut Context<Self>) {
+        let Some(copy) = self.copy.take() else { return };
+        self.search_task.take();
+        let mut g = self.grid.borrow_mut();
+        g.vt.clear_selection();
+        g.vt.clear_search();
+        g.vt.scroll_to_row(copy.entry_offset);
+        cx.notify();
+    }
+
+    fn copy_search_next(&mut self, direction: Direction, inclusive: bool, cx: &mut Context<Self>) {
+        let Some(copy) = &mut self.copy else { return };
+        let mut g = self.grid.borrow_mut();
+        let mut matches = g.vt.matches();
+        matches.sort_by_key(|(p, _)| (p.row, p.col));
+        let current = copy.cursor.point();
+        let pos = (current.row, current.col);
+        let found = match direction {
+            Direction::Forward => matches.iter().find(|(p, _)| if inclusive { (p.row, p.col) >= pos } else { (p.row, p.col) > pos }).or_else(|| matches.first()),
+            Direction::Backward => matches.iter().rev().find(|(p, _)| if inclusive { (p.row, p.col) <= pos } else { (p.row, p.col) < pos }).or_else(|| matches.last()),
+        }.copied();
+        copy.current_match = found.and_then(|(start, end)| Some((g.vt.track_point(start)?, g.vt.track_point(end)?)));
+        if let Some((start, _)) = found {
+            g.vt.move_tracked_point(&mut copy.cursor, start);
+            g.vt.show_row(start.row);
+            match &copy.selection {
+                Some(Selection::Chars { anchor }) => g.vt.set_selection(anchor.point(), start, false),
+                Some(Selection::Lines { anchor }) => g.vt.set_selection(anchor.point(), start, true),
+                None => {}
+            }
+        }
+        cx.notify();
+    }
+
+    fn run_copy_search(&mut self, prompt: Prompt, cx: &mut Context<Self>) {
+        let Some(copy) = &mut self.copy else { return };
+        copy.last_search = Some(prompt.direction);
+        copy.current_match = None;
+        copy.pending_search = true;
+        self.grid.borrow_mut().vt.start_search(&prompt.query);
+        self.search_task.take();
+        self.search_task = Some(cx.spawn(async move |this, cx| loop {
+            let done = this.update(cx, |this, cx| {
+                if this.copy.is_none() { return true; }
+                let complete = {
+                    let mut grid = this.grid.borrow_mut();
+                    grid.vt.progress_search();
+                    grid.vt.search_progress().complete
+                };
+                if complete {
+                    if let Some(copy) = &mut this.copy {
+                        copy.pending_search = false;
+                        if let Some(direction) = copy.last_search { this.copy_search_next(direction, true, cx); }
+                    }
+                }
+                complete
+            }).unwrap_or(true);
+            if done { break; }
+            cx.background_executor().timer(Duration::from_millis(33)).await;
+        }));
+    }
+
+    fn copy_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let k = &ev.keystroke;
+        let key = k.key_char.as_deref().filter(|s| !s.is_empty() && !s.chars().any(char::is_control)).unwrap_or(&k.key);
+        let Some(copy) = &mut self.copy else { return };
+        if let Some(prompt) = &mut copy.prompt {
+            match key {
+                "escape" => { copy.prompt = None; }
+                "enter" => {
+                    let prompt = copy.prompt.take().unwrap();
+                    self.run_copy_search(prompt, cx);
+                }
+                "backspace" => { prompt.query.pop(); }
+                _ if !k.modifiers.control && !k.modifiers.platform && !k.modifiers.alt => {
+                    if let Some(text) = k.key_char.as_deref().filter(|text| !text.chars().any(char::is_control)) {
+                        prompt.query.push_str(text);
+                    } else if key == "space" { prompt.query.push(' '); }
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
+        if k.modifiers.platform || k.modifiers.alt || (k.modifiers.control && !matches!(k.key.as_str(), "u" | "d" | "b" | "f")) {
+            return;
+        }
+        if key == "/" || key == "?" {
+            copy.prompt = Some(Prompt { direction: if key == "/" { Direction::Forward } else { Direction::Backward }, query: String::new() });
+            cx.notify();
+            return;
+        }
+        if key == "n" || key == "N" {
+            if let Some(mut direction) = copy.last_search {
+                if key == "N" { direction = if direction == Direction::Forward { Direction::Backward } else { Direction::Forward }; }
+                self.copy_search_next(direction, false, cx);
+            }
+            return;
+        }
+        if key == "q" || (key == "escape" && copy.selection.is_none() && copy.last_search.is_none()) {
+            self.exit_copy_mode(cx);
+            return;
+        }
+        if key == "escape" {
+            copy.selection = None;
+            copy.last_search = None;
+            copy.current_match = None;
+            let mut g = self.grid.borrow_mut();
+            g.vt.clear_selection();
+            g.vt.clear_search();
+            cx.notify();
+            return;
+        }
+        if key == "y" || key == "enter" {
+            if copy.selection.is_none()
+                && let Some((start, end)) = &copy.current_match
+            {
+                self.grid.borrow_mut().vt.set_selection(start.point(), end.point(), false);
+            }
+            let _ = self.copy(cx);
+            self.exit_copy_mode(cx);
+            return;
+        }
+        let mut g = self.grid.borrow_mut();
+        if matches!(key, "v" | "V" | "space" | " ") {
+            let lines = key == "V";
+            let previous = copy.selection.take();
+            let anchor = match previous {
+                Some(Selection::Chars { .. }) if !lines => None,
+                Some(Selection::Lines { .. }) if lines => None,
+                Some(Selection::Chars { anchor }) | Some(Selection::Lines { anchor }) => Some(anchor),
+                None => g.vt.track_point(copy.cursor.point()),
+            };
+            copy.selection = anchor.map(|anchor| if lines { Selection::Lines { anchor } } else { Selection::Chars { anchor } });
+        } else {
+            let half = u32::from(g.vt.rows).div_ceil(2);
+            let page = u32::from(g.vt.rows);
+            let motion = if k.modifiers.control {
+                match k.key.as_str() { "u" => Some(Motion::Up(half)), "d" => Some(Motion::Down(half)), "b" => Some(Motion::Up(page)), "f" => Some(Motion::Down(page)), _ => None }
+            } else {
+                match key {
+                    "h" | "left" => Some(Motion::Left), "l" | "right" => Some(Motion::Right),
+                    "k" | "up" => Some(Motion::Up(1)), "j" | "down" => Some(Motion::Down(1)),
+                    "0" | "home" => Some(Motion::Start), "^" => Some(Motion::FirstNonblank), "$" | "end" => Some(Motion::End),
+                    "g" => Some(Motion::FirstRow), "G" => Some(Motion::LastRow), "{" => Some(Motion::ParagraphBack), "}" => Some(Motion::ParagraphForward),
+                    "w" => Some(Motion::WordForward), "b" => Some(Motion::WordBackward), "e" => Some(Motion::WordEnd),
+                    "W" => Some(Motion::BigWordForward), "B" => Some(Motion::BigWordBackward), "E" => Some(Motion::BigWordEnd),
+                    "pageup" => Some(Motion::Up(page)), "pagedown" => Some(Motion::Down(page)), _ => None,
+                }
+            };
+            if let Some(motion) = motion {
+                let next = copy_mode::motion(&g.vt, copy.cursor.point(), motion);
+                g.vt.move_tracked_point(&mut copy.cursor, next);
+                g.vt.show_row(next.row);
+            }
+        }
+        match &copy.selection {
+            Some(Selection::Chars { anchor }) => g.vt.set_selection(anchor.point(), copy.cursor.point(), false),
+            Some(Selection::Lines { anchor }) => g.vt.set_selection(anchor.point(), copy.cursor.point(), true),
+            None => g.vt.clear_selection(),
+        }
+        drop(g);
+        cx.notify();
+    }
+
     fn key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.copy.is_some() {
+            self.copy_key(ev, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.find_field_focused(window, cx) && ev.keystroke.key == "escape" {
             self.close_search(window, cx);
             cx.stop_propagation();
@@ -1541,7 +1740,7 @@ fn find_input_style() -> InputEditorStyle {
     }
 }
 
-fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
+fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, copy_cursor: Option<vt::Point>, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
     let mut g = grid.borrow_mut();
     let cell = g.cell;
@@ -1553,6 +1752,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     let origin = bounds.origin + point(px(pad_x), px(pad_y + (spare / 2.0).floor()));
     let origin = point(snap(origin.x), snap(origin.y));
     g.origin = origin;
+    let top = g.vt.viewport_top();
     let frame = g.vt.frame();
     let placements = g.vt.placements();
     let mut images: Vec<(bool, Bounds<Pixels>, Arc<RenderImage>)> = Vec::new();
@@ -1655,6 +1855,15 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             window.paint_quad(fill(snap_box(b), highlight));
         }
     }
+    if let Some(cursor) = copy_cursor
+        && let Some(y) = cursor.row.checked_sub(top).map(|y| y as usize)
+        && let Some(row) = frame.rows.get(y)
+        && let Some(cell_at) = row.get(cursor.col as usize)
+    {
+        let width = if cell_at.wide { 2.0 } else { 1.0 };
+        let b = Bounds::new(at(cursor.col as usize, y), size(cell.width * width, cell.height));
+        window.paint_quad(fill(snap_box(b), crate::settings::color("accent").opacity(0.55)));
+    }
     for (y, (_, ops, _)) in painted.iter().enumerate() {
         for op in ops {
             match op {
@@ -1684,7 +1893,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
 
     paint_images(false, window);
 
-    if let Some(cur) = frame.cursor {
+    if let Some(cur) = frame.cursor.filter(|_| copy_cursor.is_none()) {
         let (x, y) = (cur.x as usize, cur.y as usize);
         let wide = frame.rows.get(y).and_then(|r| r.get(x)).is_some_and(|c| c.wide);
         let w = cell.width * if wide { 2.0 } else { 1.0 };
@@ -1852,6 +2061,18 @@ impl Render for TerminalView {
         self.grid.borrow_mut().link_spans = spans.unwrap_or_default();
         let grid = self.grid.clone();
         let grid_paint = self.grid.clone();
+        let copy_cursor = self.copy.as_ref().map(|copy| copy.cursor.point());
+        let copy_label = self.copy.as_ref().map(|copy| {
+            let mode = match &copy.selection { Some(Selection::Chars { .. }) => "COPY · select", Some(Selection::Lines { .. }) => "COPY · line", None => "COPY" };
+            let prompt = copy.prompt.as_ref().map(|prompt| format!("  {}{}", if prompt.direction == Direction::Forward { "/" } else { "?" }, prompt.query)).unwrap_or_default();
+            let progress = self.grid.borrow().vt.search_progress();
+            let count = if progress.total > 0 {
+                let matches = self.grid.borrow().vt.matches();
+                let index = copy.current_match.as_ref().and_then(|(start, end)| matches.iter().position(|item| *item == (start.point(), end.point()))).map_or(0, |i| i + 1);
+                format!("  n/N  {index}/{}", progress.total)
+            } else { String::new() };
+            format!("{mode}{prompt}{count}")
+        });
         let selection_view = cx.entity().downgrade();
         let (input_focus, input_view) = (self.focus.clone(), cx.entity());
         let ended = self.ended.clone().or_else(|| self.lost.then(|| "reconnecting to core…".to_owned()));
@@ -1873,7 +2094,7 @@ impl Render for TerminalView {
         div()
             .id(SharedString::from(format!("term-{}", self.address)))
             .track_focus(&self.focus)
-            .key_context("Terminal")
+            .key_context(if self.copy.is_some() { "Terminal CopyMode" } else { "Terminal" })
             .size_full()
             .relative()
             // Below 1, the layout's background shows through (cells a program colors stay solid).
@@ -1911,6 +2132,7 @@ impl Render for TerminalView {
                 }
             }))
             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                this.exit_copy_mode(cx);
                 this.focus.focus(window, cx);
                 if link_mods(&ev.modifiers)
                     && let Some((target, _)) = this.link_at(ev.position)
@@ -1950,6 +2172,7 @@ impl Render for TerminalView {
             // (agent TUIs do, and then a pane had no menu at all), unless the pane
             // sends right-clicks to its program.
             .on_mouse_down(MouseButton::Right, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                this.exit_copy_mode(cx);
                 cx.stop_propagation();
                 if this.right_click_to_program && this.takes_mouse(ev.modifiers) {
                     this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers);
@@ -1958,6 +2181,7 @@ impl Render for TerminalView {
                 }
             }))
             .on_mouse_down(MouseButton::Middle, cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                this.exit_copy_mode(cx);
                 if !this.mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(ev.button), ev.position, ev.modifiers) {
                     this.paste(cx);
                 }
@@ -1978,7 +2202,7 @@ impl Render for TerminalView {
                         grid.borrow_mut().fit(cols, rows, cell, window.scale_factor());
                     },
                     move |bounds, _, window, cx| {
-                        paint_grid(bounds, &grid_paint, focused, window, cx);
+                        paint_grid(bounds, &grid_paint, focused, copy_cursor, window, cx);
                         let view = selection_view.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture {
@@ -2042,6 +2266,12 @@ impl Render for TerminalView {
                 )
                 .size_full(),
             )
+            .when_some(copy_label, |d, label| {
+                d.child(div().id("copy-mode-bar").absolute().top_2().right_2().px_2().py_1().rounded_md()
+                    .border_1().border_color(rgb(0xd94b4b))
+                    .bg(crate::settings::color("popover")).text_xs().text_color(rgb(0xd94b4b))
+                    .child(label))
+            })
             .when_some(search_input, |d, input| {
                 d.child(
                     div()
@@ -2218,6 +2448,86 @@ mod tests {
             cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
             assert!(!root.read_with(cx, |root, cx| root.text.read(cx).selected_text()).is_empty());
         }
+    }
+
+    #[gpui::test]
+    fn copy_mode_search_wraps_and_escape_preserves_previous_query(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        struct Root(Entity<super::TerminalView>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div().size_full().child(self.0.clone()) }
+        }
+        cx.update(gpui_base::init);
+        let (root, cx) = cx.add_window_view(|_, cx| Root(cx.new(|cx| {
+            let terminal = super::TerminalView::attach(crate::hc::offline(), "t1".into(), (30, 3), cx);
+            terminal.grid.borrow_mut().vt.write(b"alpha beta alpha");
+            terminal
+        })));
+        cx.run_until_parked();
+        cx.update(|window, app| root.update(app, |root, app| root.0.update(app, |t, cx| t.enter_copy_mode(window, cx))));
+        cx.simulate_keystrokes("0 / a l p h a enter");
+        cx.run_until_parked();
+        let current = |root: &Root, cx: &App| root.0.read(cx).copy.as_ref().unwrap().cursor.point().col;
+        root.read_with(cx, |root, cx| assert_eq!(current(root, cx), 0));
+        cx.simulate_keystrokes("n");
+        root.read_with(cx, |root, cx| assert_eq!(current(root, cx), 11));
+        cx.simulate_keystrokes("n");
+        root.read_with(cx, |root, cx| assert_eq!(current(root, cx), 0));
+        cx.simulate_keystrokes("shift-n");
+        root.read_with(cx, |root, cx| assert_eq!(current(root, cx), 11));
+        cx.simulate_keystrokes("/ x escape n");
+        root.read_with(cx, |root, cx| assert_eq!(current(root, cx), 0));
+    }
+
+    #[gpui::test]
+    fn copy_mode_search_moves_and_copies_a_match(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        struct Root(Entity<super::TerminalView>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement { div().size_full().child(self.0.clone()) }
+        }
+        cx.update(gpui_base::init);
+        let (root, cx) = cx.add_window_view(|_, cx| Root(cx.new(|cx| {
+            let terminal = super::TerminalView::attach(crate::hc::offline(), "t1".into(), (20, 3), cx);
+            terminal.grid.borrow_mut().vt.write(b"alpha beta alpha");
+            terminal
+        })));
+        cx.run_until_parked();
+        cx.update(|window, app| root.update(app, |root, app| root.0.update(app, |t, cx| t.enter_copy_mode(window, cx))));
+        cx.simulate_keystrokes("0 / a l p h a enter");
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| {
+            let terminal = root.0.read(cx);
+            let copy = terminal.copy.as_ref().unwrap();
+            assert!(copy.prompt.is_none(), "prompt still open");
+            assert!(copy.last_search.is_some(), "search did not start");
+            assert!(!copy.pending_search, "search still pending");
+            assert!(copy.current_match.is_some(), "no match: {:?}", terminal.grid.borrow().vt.search_progress());
+        });
+        cx.simulate_keystrokes("y");
+        cx.update(|_, app| assert_eq!(app.read_from_clipboard().unwrap().text().as_deref(), Some("alpha")));
+    }
+
+    #[gpui::test]
+    fn copy_mode_selects_text_and_restores_viewport(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        struct Root(Entity<super::TerminalView>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.0.clone())
+            }
+        }
+        cx.update(gpui_base::init);
+        let (root, cx) = cx.add_window_view(|_, cx| Root(cx.new(|cx| {
+            let terminal = super::TerminalView::attach(crate::hc::offline(), "t1".into(), (20, 3), cx);
+            terminal.grid.borrow_mut().vt.write(b"hello world");
+            terminal
+        })));
+        cx.run_until_parked();
+        cx.update(|window, app| root.update(app, |root, app| root.0.update(app, |t, cx| t.enter_copy_mode(window, cx))));
+        cx.simulate_keystrokes("0 v l l y");
+        cx.update(|_, app| assert_eq!(app.read_from_clipboard().unwrap().text().as_deref(), Some("hel")));
+        root.read_with(cx, |root, cx| assert!(root.0.read(cx).copy.is_none()));
     }
 
     #[gpui::test]
@@ -2621,7 +2931,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn shipped_find_binding_opens_search_but_ctrl_f_reaches_the_program(cx: &mut gpui::TestAppContext) {
+    fn shipped_find_and_copy_mode_bindings_work(cx: &mut gpui::TestAppContext) {
         use gpui::*;
 
         struct Root(Entity<super::TerminalView>);
@@ -2631,10 +2941,10 @@ mod tests {
                     .key_context("Herdr")
                     .size_full()
                     .on_action(cx.listener(|this, action: &gpui_shell::action::ShellAction, window, cx| {
-                        if action.id() == "terminal.search" {
-                            this.0.update(cx, |terminal, cx| terminal.open_search(window, cx));
-                        } else {
-                            cx.propagate();
+                        match action.id() {
+                            "terminal.search" => this.0.update(cx, |terminal, cx| terminal.open_search(window, cx)),
+                            "terminal.copy_mode" => this.0.update(cx, |terminal, cx| terminal.enter_copy_mode(window, cx)),
+                            _ => cx.propagate(),
                         }
                     }))
                     .child(self.0.clone())
@@ -2654,13 +2964,23 @@ mod tests {
             });
         });
 
-        cx.simulate_keystrokes("ctrl-f");
+        cx.simulate_keystrokes("ctrl-f x");
         cx.run_until_parked();
         root.read_with(cx, |root, cx| {
             let terminal = root.0.read(cx);
             assert!(!terminal.search_open);
-            assert!(terminal.typed_at.get().is_some(), "Ctrl+F must reach the program");
+            assert!(terminal.typed_at.get().is_some(), "an unmatched sequence must reach the program");
         });
+        cx.simulate_keystrokes("ctrl-f enter");
+        cx.run_until_parked();
+        root.read_with(cx, |root, cx| assert!(root.0.read(cx).copy.is_some()));
+        root.update(cx, |root, cx| root.0.update(cx, |terminal, _| {
+            let mut g = terminal.grid.borrow_mut();
+            for _ in 0..20 { g.vt.write(b"line\r\n"); }
+        }));
+        cx.simulate_keystrokes("g ctrl-f");
+        root.read_with(cx, |root, cx| assert!(root.0.read(cx).copy.as_ref().unwrap().cursor.point().row > 0, "Ctrl-F moves a page inside copy mode"));
+        cx.simulate_keystrokes("q");
         cx.simulate_keystrokes(if cfg!(target_os = "macos") { "cmd-f" } else { "ctrl-shift-f" });
         cx.run_until_parked();
         root.read_with(cx, |root, cx| assert!(root.0.read(cx).search_open));

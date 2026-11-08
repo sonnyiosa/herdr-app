@@ -311,6 +311,12 @@ Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when 
 
 No arguments.
 
+## `terminal.copy_mode`
+
+Move through and copy terminal text with the keyboard.
+
+No arguments.
+
 ## `terminal.search`
 
 Search the focused terminal's screen and scrollback; the find bar and query stay with that terminal.

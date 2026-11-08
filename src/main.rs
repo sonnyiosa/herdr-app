@@ -3,6 +3,7 @@
 
 mod bench;
 mod commands;
+mod copy_mode;
 mod control;
 mod core_bin;
 mod files;

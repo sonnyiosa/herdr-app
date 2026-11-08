@@ -518,6 +518,7 @@ shortcuts must then be added by hand.
   Existing `keys.json` files don't need to change.
 - Terminal keys honor the program's negotiated Kitty mode, including on Windows.
 - Windows terminal Escape stays separate from the following key.
+- Copy mode: `ctrl-f enter` runs `terminal.copy_mode`. Move with `h/j/k/l` or arrows, `0/^/$`, `w/b/e` (uppercase for whitespace-separated words), `{`/`}`, `g/G`, Ctrl-U/D/B/F or Page Up/Down. `v` or Space selects characters; `V` selects lines. `/` and `?` search, `n/N` repeat, `y` or Enter copies and exits, and `q` exits. Escape clears selection or search before exiting.
 - Search: `ctrl-shift-f` (Cmd-F on macOS) opens a find bar inside the focused terminal;
   Enter/Shift-Enter moves through matches and Escape closes it while the find field
   has focus. Clicking the terminal puts typing, including Escape, back in the program;
@@ -578,7 +579,7 @@ The main ones:
   starting directory for tabs and right/down splits, with or without `argv`), `terminal.kill {terminal}`,
   `terminal.keep {terminal, place?}`, `terminal.park {terminal}`,
   `terminal.peek {terminal}` (peek over the tab, with keep-as-tab and close),
-  `terminal.show {terminal?, pane?}`, `terminal.search` (screen and scrollback;
+  `terminal.show {terminal?, pane?}`, `terminal.copy_mode` (keyboard selection), `terminal.search` (screen and scrollback;
   find bar state stays with that terminal), `terminal.copy`, `terminal.paste` (copied
   files, such as Finder's or a clipboard manager's image, as if dropped; an image
   alone as `terminal.paste_image` pastes it), `terminal.paste_image` (Ctrl+V: an

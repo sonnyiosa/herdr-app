@@ -3140,6 +3140,11 @@ impl AppWindow {
                     self.focused_pane = None;
                 }
             }
+            "terminal.copy_mode" => {
+                let Some(t) = self.focused_terminal(window, cx) else { return self.fail("no focused terminal for copy mode") };
+                t.view.update(cx, |view, cx| view.enter_copy_mode(window, cx));
+                return;
+            }
             "terminal.search" => {
                 let Some(t) = self.focused_terminal(window, cx) else { return self.fail("no focused terminal to search") };
                 t.view.update(cx, |view, cx| view.open_search(window, cx));

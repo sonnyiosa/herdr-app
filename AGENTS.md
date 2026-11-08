@@ -12,11 +12,11 @@ Preserve compatibility with released versions and installed user data.
 Discuss breaking changes and removal of compatibility code with the maintainer
 before changing documented behavior.
 
-## Before you grow the app's core: ask Can
+## Before you grow the app's core
 
 The app's core (the model, machine layout documents, commands, and shared mod APIs)
 stays small; everything else is mods. Before adding anything to it, answer
-these three, then discuss with Can and wait for his go:
+these three:
 
 1. Does the app itself act on it (it changes what the app does, not only
    how something looks)?
@@ -25,8 +25,8 @@ these three, then discuss with Can and wait for his go:
 3. Can mods not do it correctly, even with care?
 
 If all three are no, it belongs in mods (their shared storage, their own
-code), even at the price of some repetition. Same for herdr-core: what the
-app asks of it goes through Can too.
+code), even at the price of some repetition. The same three apply to what the
+app asks of herdr-core.
 
 `herdr-app --skill` prints the window manual in `src/SKILL.md`.
 Keep it current when changing agent-facing behavior.

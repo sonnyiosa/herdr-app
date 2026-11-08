@@ -1,5 +1,10 @@
 # Herdr changelog
 
+## Next
+
+### New
+- Keyboard copy mode for terminal text and scrollback, opened with Ctrl-F then Enter.
+
 ## [0.1.13] - 2026-11-04
 <!-- spotlight macos -->
 

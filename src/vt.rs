@@ -9,6 +9,31 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Point {
+    pub row: u32,
+    pub col: u16,
+}
+
+pub struct TrackedPoint(GhosttyTrackedGridRef);
+
+impl TrackedPoint {
+    pub fn point(&self) -> Point {
+        let mut point = GhosttyPointCoordinate::default();
+        if unsafe { ghostty_tracked_grid_ref_point(self.0, GHOSTTY_POINT_TAG_SCREEN, &mut point) } == GHOSTTY_SUCCESS {
+            Point { row: point.y, col: point.x }
+        } else {
+            Point { row: 0, col: 0 }
+        }
+    }
+}
+
+impl Drop for TrackedPoint {
+    fn drop(&mut self) {
+        unsafe { ghostty_tracked_grid_ref_free(self.0) };
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
@@ -519,20 +544,20 @@ pub type Spans = Vec<(u16, u16, u16)>;
 
 /// A character of link text and the cell it shows in.
 #[derive(Clone)]
-struct Spot {
-    y: u32,
-    x: u16,
-    width: u16,
-    byte: usize,
+pub struct Spot {
+    pub y: u32,
+    pub x: u16,
+    pub width: u16,
+    pub byte: usize,
     uri: Option<String>,
 }
 
 /// A screen row's text, where each character shows, and whether the
 /// terminal wrapped it onto the next.
-struct Row {
-    text: String,
-    spots: Vec<Spot>,
-    wraps: bool,
+pub struct Row {
+    pub text: String,
+    pub spots: Vec<Spot>,
+    pub wraps: bool,
 }
 
 /// The text of `rows` and where each character shows. Where a row doesn't
@@ -1065,14 +1090,14 @@ impl Vt {
         // A URL longer than this many rows isn't one worth finding.
         const REACH: u32 = 32;
         let mut first = hovered;
-        while first > 0 && hovered - first < REACH && self.wraps(first - 1) {
+        while first > 0 && hovered - first < REACH && self.row(first - 1).is_some_and(|row| row.wraps) {
             first -= 1;
         }
         let mut last = hovered;
-        while last - hovered < REACH && self.wraps(last) && self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, last + 1).is_some() {
+        while last - hovered < REACH && self.row(last).is_some_and(|row| row.wraps) && self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, last + 1).is_some() {
             last += 1;
         }
-        let mut rows: Vec<Row> = (first..=last).map_while(|y| self.link_row(y)).collect();
+        let mut rows: Vec<Row> = (first..=last).map_while(|y| self.row(y)).collect();
         let (text, spots) = link_text(&rows);
         let at = spots.iter().position(|s| s.y == hovered && s.x <= col && col < s.x + s.width)?;
         let hit = self.link_in(&text, &spots, top, at, &mut find, false);
@@ -1087,7 +1112,7 @@ impl Vt {
         let mut above = Vec::new();
         if text[..word.start].trim().is_empty() {
             for y in (first.saturating_sub(BROKEN)..first).rev() {
-                match self.link_row(y) {
+                match self.row(y) {
                     Some(row) if row.full(self.cols) => above.push(row),
                     _ => break,
                 }
@@ -1096,7 +1121,7 @@ impl Vt {
         let mut below = Vec::new();
         if text[word.end..].trim().is_empty() && rows.last().is_some_and(|row| row.full(self.cols)) {
             for y in last + 1..=last + BROKEN {
-                let Some(row) = self.link_row(y) else { break };
+                let Some(row) = self.row(y) else { break };
                 let full = row.full(self.cols);
                 below.push(row);
                 if !full {
@@ -1140,21 +1165,16 @@ impl Vt {
         }
     }
 
-    /// Whether the terminal wrapped screen row `y` onto the next.
-    fn wraps(&self, y: u32) -> bool {
-        unsafe {
-            let Some(r) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, y) else { return false };
-            let mut line: GhosttyRow = Default::default();
-            let mut wrap = false;
-            ghostty_grid_ref_row(&r, &mut line) == GHOSTTY_SUCCESS
-                && ghostty_row_get(line, GHOSTTY_ROW_DATA_WRAP, &mut wrap as *mut _ as *mut c_void) == GHOSTTY_SUCCESS
-                && wrap
-        }
-    }
-
     /// The text of screen row `y` and where each character shows.
-    fn link_row(&self, y: u32) -> Option<Row> {
+    pub fn row(&self, y: u32) -> Option<Row> {
         let mut r = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, y)?;
+        let mut line: GhosttyRow = Default::default();
+        let mut wraps = false;
+        unsafe {
+            if ghostty_grid_ref_row(&r, &mut line) == GHOSTTY_SUCCESS {
+                ghostty_row_get(line, GHOSTTY_ROW_DATA_WRAP, &mut wraps as *mut _ as *mut c_void);
+            }
+        }
         let mut text = String::new();
         let mut spots: Vec<Spot> = Vec::new();
         for x in 0..self.cols {
@@ -1183,7 +1203,7 @@ impl Vt {
             let width = if wide == GHOSTTY_CELL_WIDE_WIDE { 2 } else { 1 };
             spots.push(Spot { y, x, width, byte, uri });
         }
-        Some(Row { text, spots, wraps: self.wraps(y) })
+        Some(Row { text, spots, wraps })
     }
 
     /// The link `find` sees in `text` at spot `at`.
@@ -1210,6 +1230,20 @@ impl Vt {
             }
         }
         Some(LinkHit { target, spans })
+    }
+
+    pub fn set_selection(&mut self, mut start: Point, mut end: Point, lines: bool) {
+        if lines {
+            if start.row > end.row {
+                std::mem::swap(&mut start, &mut end);
+            }
+            start.col = 0;
+            end.col = self.cols.saturating_sub(1);
+        }
+        let Some(start) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, start.col, start.row) else { return };
+        let Some(end) = self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, end.col, end.row) else { return };
+        let selection = GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), start, end, rectangle: false };
+        unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, &selection as *const _ as *const c_void) };
     }
 
     pub fn clear_selection(&mut self) {
@@ -1309,6 +1343,46 @@ impl Vt {
         sb
     }
 
+    pub fn cursor_point(&self) -> Option<Point> {
+        let (mut x, mut y) = (0u16, 0u16);
+        unsafe {
+            ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_CURSOR_X, &mut x as *mut _ as *mut c_void);
+            ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &mut y as *mut _ as *mut c_void);
+        }
+        let row = self.screen_rows().saturating_sub(u32::from(self.rows)) + u32::from(y);
+        (row >= self.viewport_top() && row < self.viewport_top() + u32::from(self.rows)).then_some(Point { row, col: x })
+    }
+
+    pub fn move_tracked_point(&self, tracked: &mut TrackedPoint, point: Point) {
+        let mut p = GhosttyPoint { tag: GHOSTTY_POINT_TAG_SCREEN, ..Default::default() };
+        p.value.coordinate = GhosttyPointCoordinate { x: point.col, y: point.row };
+        ok(unsafe { ghostty_tracked_grid_ref_set(tracked.0, self.term, p) }, "tracked_grid_ref_set");
+    }
+
+    pub fn track_point(&self, point: Point) -> Option<TrackedPoint> {
+        let mut p = GhosttyPoint { tag: GHOSTTY_POINT_TAG_SCREEN, ..Default::default() };
+        p.value.coordinate = GhosttyPointCoordinate { x: point.col, y: point.row };
+        let mut tracked = std::ptr::null_mut();
+        (unsafe { ghostty_terminal_grid_ref_track(self.term, p, &mut tracked) } == GHOSTTY_SUCCESS).then_some(TrackedPoint(tracked))
+    }
+
+    pub fn viewport_top(&self) -> u32 {
+        self.scrollbar().offset as u32
+    }
+
+    pub fn screen_rows(&self) -> u32 {
+        self.scrollbar().total as u32
+    }
+
+    pub fn show_row(&mut self, row: u32) {
+        let top = self.viewport_top();
+        if row < top {
+            self.scroll_to_row(row as usize);
+        } else if row >= top + u32::from(self.rows) {
+            self.scroll_to_row((row + 1 - u32::from(self.rows)) as usize);
+        }
+    }
+
     pub fn scroll_to_bottom(&mut self) {
         self.placements_cache.get_mut().take();
         let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_BOTTOM, ..Default::default() };
@@ -1351,6 +1425,30 @@ impl Vt {
 
     pub fn clear_search(&mut self) {
         self.set_search_needle("");
+    }
+
+    pub fn matches(&self) -> Vec<(Point, Point)> {
+        let Some(search) = self.search.filter(|_| self.search_active) else { return Vec::new() };
+        let mut buffer = GhosttySelectionBuffer { ptr: std::ptr::null_mut(), cap: 0, len: 0 };
+        let result = unsafe { ghostty_search_get(search, GHOSTTY_SEARCH_DATA_MATCHES, &mut buffer as *mut _ as *mut c_void) };
+        if result != GHOSTTY_OUT_OF_SPACE || buffer.len == 0 {
+            return Vec::new();
+        }
+        let mut matches: Vec<_> = std::iter::repeat_with(|| GhosttySelection { size: std::mem::size_of::<GhosttySelection>(), ..Default::default() }).take(buffer.len).collect();
+        buffer.ptr = matches.as_mut_ptr();
+        buffer.cap = matches.len();
+        buffer.len = 0;
+        if unsafe { ghostty_search_get(search, GHOSTTY_SEARCH_DATA_MATCHES, &mut buffer as *mut _ as *mut c_void) } != GHOSTTY_SUCCESS {
+            return Vec::new();
+        }
+        matches.iter().take(buffer.len).filter_map(|selection| {
+            let convert = |reference: &GhosttyGridRef| {
+                let mut point = GhosttyPointCoordinate::default();
+                (unsafe { ghostty_terminal_point_from_grid_ref(self.term, reference, GHOSTTY_POINT_TAG_SCREEN, &mut point) } == GHOSTTY_SUCCESS)
+                    .then_some(Point { row: point.y, col: point.x })
+            };
+            Some((convert(&selection.start)?, convert(&selection.end)?))
+        }).collect()
     }
 
     pub fn search_progress(&self) -> SearchProgress {
@@ -1873,6 +1971,66 @@ mod tests {
         assert!(!first.search_spans.is_empty(), "selecting a history result scrolls it into view");
         assert!(first.search_spans.iter().all(|span| span.selected));
         assert_eq!(second.search_spans, second_spans, "searching one terminal doesn't draw in another");
+    }
+
+    #[test]
+    fn copy_points_follow_scrollback_and_cursor_visibility() {
+        let mut vt = Vt::new(8, 2);
+        vt.write(b"first\r\nsecond");
+        assert_eq!(vt.cursor_point(), Some(Point { row: 1, col: 6 }));
+        let mut tracked = vt.track_point(Point { row: 0, col: 0 }).unwrap();
+        vt.move_tracked_point(&mut tracked, Point { row: 0, col: 1 });
+        vt.write(b"\r\nthird");
+        assert_eq!(tracked.point(), Point { row: 0, col: 1 });
+        vt.scroll_to_top();
+        assert_eq!(vt.cursor_point(), None);
+        vt.write(b"\x1b[3J");
+        assert_eq!(tracked.point(), Point { row: 0, col: 0 });
+    }
+
+    #[test]
+    fn screen_matches_include_scrollback() {
+        let mut vt = Vt::new(12, 2);
+        vt.write(b"foo\r\nbar\r\nFOO");
+        vt.start_search("foo");
+        finish_search(&mut vt);
+        let matches = vt.matches();
+        assert_eq!(matches, vec![(Point { row: 2, col: 0 }, Point { row: 2, col: 2 }), (Point { row: 0, col: 0 }, Point { row: 0, col: 2 })]);
+    }
+
+    #[test]
+    fn screen_selection_copies_characters_and_full_lines() {
+        let mut vt = Vt::new(10, 3);
+        vt.write("hello\r\n世界!".as_bytes());
+        vt.set_selection(Point { row: 0, col: 1 }, Point { row: 0, col: 3 }, false);
+        assert_eq!(vt.selection_text().as_deref(), Some("ell"));
+        vt.set_selection(Point { row: 1, col: 2 }, Point { row: 0, col: 3 }, true);
+        assert_eq!(vt.selection_text().as_deref(), Some("hello\n世界!"));
+    }
+
+    #[test]
+    fn show_row_scrolls_only_when_outside_viewport() {
+        let mut vt = Vt::new(10, 3);
+        vt.write(b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        assert_eq!(vt.screen_rows(), 5);
+        assert_eq!(vt.viewport_top(), 2);
+        vt.show_row(3);
+        assert_eq!(vt.viewport_top(), 2);
+        vt.show_row(0);
+        assert_eq!(vt.viewport_top(), 0);
+        vt.show_row(3);
+        assert_eq!(vt.viewport_top(), 1);
+    }
+
+    #[test]
+    fn screen_row_preserves_wide_cells_and_wraps() {
+        let mut vt = Vt::new(5, 2);
+        vt.write("abc日本".as_bytes());
+        let first = vt.row(0).unwrap();
+        assert_eq!(first.text, "abc日");
+        assert!(first.wraps);
+        assert_eq!((first.spots[3].x, first.spots[3].width), (3, 2));
+        assert!(vt.row(2).is_none());
     }
 
     #[test]

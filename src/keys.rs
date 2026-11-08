@@ -24,9 +24,7 @@ use std::collections::BTreeMap;
 /// The reserved shortcut that restores the default layout and keys.
 pub const ESCAPE_HATCH: &str = "ctrl-alt-shift-escape";
 
-/// The shipped keys: prefix-free; plain ctrl+letter always stays with the
-/// program. Herdr uses ctrl+shift (defaults/keys.json), or cmd on macOS
-/// (defaults/keys.macos.json, with Mac terminal editing keys).
+/// The shipped keys use ctrl+shift, or cmd on macOS, plus the ctrl-f copy-mode prefix.
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULTS: &str = include_str!("../defaults/keys.json");
 #[cfg(target_os = "macos")]
@@ -39,11 +37,13 @@ const SHIPPED_KEYS: &[&str] = &[
     include_str!("keys/shipped/v0.1.4-keys.json"),
     include_str!("keys/shipped/v0.1.5-keys.json"),
     include_str!("keys/shipped/v0.1.12-keys.json"),
+    include_str!("keys/shipped/v0.1.13-keys.json"),
 ];
 #[cfg(any(target_os = "macos", test))]
 const SHIPPED_MACOS_KEYS: &[&str] = &[
     include_str!("keys/shipped/v0.1.4-keys.macos.json"),
     include_str!("keys/shipped/v0.1.5-keys.macos.json"),
+    include_str!("keys/shipped/v0.1.13-keys.macos.json"),
 ];
 
 #[derive(serde::Deserialize)]
@@ -217,7 +217,12 @@ pub fn parse(text: &str) -> Result<Vec<KeyBinding>, String> {
                 problems.push(format!("{ESCAPE_HATCH} is reserved for resetting Herdr"));
                 continue;
             }
-            let predicate = match KeyBindingContextPredicate::parse(&ctx) {
+            let binding_context = if section == "terminal" && string.as_deref() == Some("terminal.copy_mode") {
+                format!("{ctx} && !CopyMode")
+            } else {
+                ctx.clone()
+            };
+            let predicate = match KeyBindingContextPredicate::parse(&binding_context) {
                 Ok(p) => Some(Rc::new(p)),
                 Err(e) => {
                     problems.push(format!("{section}: {e}"));

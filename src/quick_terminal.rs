@@ -138,6 +138,7 @@ impl Render for QuickTerminal {
                     "terminal.paste" => terminal.update(cx, |terminal, cx| terminal.paste(cx)),
                     "terminal.paste_image" => terminal.update(cx, |terminal, cx| terminal.paste_image(cx)),
                     "terminal.search" => terminal.update(cx, |terminal, cx| terminal.open_search(window, cx)),
+                    "terminal.copy_mode" => terminal.update(cx, |terminal, cx| terminal.enter_copy_mode(window, cx)),
                     _ => cx.propagate(),
                 }
             }))
