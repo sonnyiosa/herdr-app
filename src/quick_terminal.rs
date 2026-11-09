@@ -38,13 +38,15 @@ struct QuickTerminal {
     visible: Rc<Cell<bool>>,
     dock_owned: Rc<Cell<bool>>,
     animation: Rc<native::Animation>,
+    previous_app: Option<native::PreviousApp>,
+    preserve_previous: bool,
     _activation: Subscription,
     terminal_subscription: Option<Subscription>,
     starting: bool,
 }
 
 impl QuickTerminal {
-    fn new(core: Arc<Core>, height: f32, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(core: Arc<Core>, height: f32, previous_app: Option<native::PreviousApp>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         native::make_borderless(window);
         let visible = Rc::new(Cell::new(true));
         let dock_owned = Rc::new(Cell::new(false));
@@ -59,10 +61,12 @@ impl QuickTerminal {
         });
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() && this.visible.replace(false) {
+                this.previous_app = None;
+                this.preserve_previous = false;
                 native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), None, cx);
             }
         });
-        let mut quick = Self { core, height: Rc::new(Cell::new(height)), terminal: None, error: None, visible, dock_owned, animation, _activation: activation, terminal_subscription: None, starting: false };
+        let mut quick = Self { core, height: Rc::new(Cell::new(height)), terminal: None, error: None, visible, dock_owned, animation, previous_app, preserve_previous: false, _activation: activation, terminal_subscription: None, starting: false };
         quick.start(window, cx);
         quick
     }
@@ -99,6 +103,8 @@ impl QuickTerminal {
                         });
                         this.terminal_subscription = Some(cx.subscribe_in(&terminal, window, |this, _, event: &TerminalEvent, window, cx| {
                             if matches!(event, TerminalEvent::Ended) {
+                                this.previous_app = None;
+                                this.preserve_previous = false;
                                 this.terminal = None;
                                 this.terminal_subscription = None;
                                 if this.visible.replace(false) {
@@ -180,8 +186,19 @@ pub fn toggle(cx: &mut App) {
         if handle.update(cx, |this, window, cx| {
             if this.visible.get() {
                 this.visible.set(false);
+                this.preserve_previous = !window.is_window_active();
+                if !this.preserve_previous {
+                    if let Some(previous_app) = this.previous_app.take() {
+                        previous_app.activate();
+                    }
+                }
                 native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), None, cx);
             } else {
+                let frontmost = native::PreviousApp::frontmost();
+                if frontmost.is_some() || !this.preserve_previous {
+                    this.previous_app = frontmost;
+                }
+                this.preserve_previous = false;
                 this.visible.set(true);
                 let pending = (this.height.get() != height)
                     .then(|| window.display(cx).map(|d| (f32::from(d.bounds().size.height) * height, height, this.height.clone())))
@@ -209,7 +226,8 @@ pub fn toggle(cx: &mut App) {
         is_minimizable: false,
         ..Default::default()
     };
-    match cx.open_window(options, |window, cx| cx.new(|cx| QuickTerminal::new(core, height, window, cx))) {
+    let previous_app = native::PreviousApp::frontmost();
+    match cx.open_window(options, |window, cx| cx.new(|cx| QuickTerminal::new(core, height, previous_app, window, cx))) {
         Ok(handle) => {
             cx.global_mut::<QuickTerminalState>().window = Some(handle);
             let _ = handle.update(cx, |this, window, cx| {
@@ -278,6 +296,41 @@ mod native {
     unsafe fn send_id(object: *mut c_void, selector: &[u8]) -> *mut c_void {
         let f: unsafe extern "C" fn(*mut c_void, *const c_void) -> *mut c_void = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
         unsafe { f(object, sel_registerName(selector.as_ptr().cast())) }
+    }
+
+    pub struct PreviousApp(*mut c_void);
+
+    impl PreviousApp {
+        pub fn frontmost() -> Option<Self> {
+            unsafe {
+                let workspace = send_id(objc_getClass(c"NSWorkspace".as_ptr()), b"sharedWorkspace\0");
+                let app = send_id(workspace, b"frontmostApplication\0");
+                if app.is_null() { return None; }
+                let pid: unsafe extern "C" fn(*mut c_void, *const c_void) -> i32 = std::mem::transmute(objc_msgSend as *const ());
+                if pid(app, sel_registerName(c"processIdentifier".as_ptr())) == std::process::id() as i32 { return None; }
+                send_id(app, b"retain\0");
+                Some(Self(app))
+            }
+        }
+
+        pub fn activate(&self) {
+            unsafe {
+                let terminated: unsafe extern "C" fn(*mut c_void, *const c_void) -> bool = std::mem::transmute(objc_msgSend as *const ());
+                if !terminated(self.0, sel_registerName(c"isTerminated".as_ptr())) {
+                    let activate: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> bool = std::mem::transmute(objc_msgSend as *const ());
+                    activate(self.0, sel_registerName(c"activateWithOptions:".as_ptr()), 1 << 1);
+                }
+            }
+        }
+    }
+
+    impl Drop for PreviousApp {
+        fn drop(&mut self) {
+            unsafe {
+                let release: unsafe extern "C" fn(*mut c_void, *const c_void) = std::mem::transmute(objc_msgSend as *const ());
+                release(self.0, sel_registerName(c"release".as_ptr()));
+            }
+        }
     }
 
     fn ns_window(window: &Window) -> Option<*mut c_void> {

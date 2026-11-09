@@ -30,7 +30,8 @@ Remove it or set it to null to disable it. The installed guide documents the
 supported keys and how registration failures are reported.
 Set `quick_terminal_height` to a display-height fraction from `0.1` to `1.0`;
 the default is `0.5`. Changes take effect the next time the terminal is shown.
-The quick terminal hides when it loses window focus. New sessions start in the
+The quick terminal hides when it loses window focus. Hiding it with the shortcut
+restores the previously active application when available. New sessions start in the
 home directory. Exiting the terminal hides it; the next show starts a new session.
 
 ## Show something when asked
