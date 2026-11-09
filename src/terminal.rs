@@ -13,10 +13,35 @@ use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::collections::HashMap;
+use std::future::Future;
+use std::task::Poll;
 use crate::links;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+
+const OUTPUT_TIME_PER_TURN: Duration = Duration::from_millis(6);
+
+fn output_turn(
+    first: Stream,
+    rx: &async_channel::Receiver<Stream>,
+    budget: Duration,
+) -> impl Iterator<Item = Stream> + '_ {
+    let deadline = Instant::now() + budget;
+    let mut first = Some(first);
+    let mut ended = false;
+    std::iter::from_fn(move || {
+        let item = if let Some(first) = first.take() {
+            first
+        } else {
+            // Released cores send frames of at most 16 KiB; a turn can overshoot by one frame.
+            if ended || Instant::now() >= deadline { return None; }
+            rx.try_recv().ok()?
+        };
+        ended = !matches!(item, Stream::Data(_));
+        Some(item)
+    })
+}
 
 fn pad() -> (f32, f32) {
     let p = crate::settings::get().terminal_padding;
@@ -55,6 +80,8 @@ struct Grid {
     vt: Vt,
     core: Arc<Core>,
     channel: Option<u32>,
+    attach_ready: bool,
+    fit_ready: Option<async_channel::Sender<()>>,
     cell: Size<Pixels>,
     /// The window's scale factor, from the last prepaint. Programs see cells,
     /// images and pixel mouse reports in device pixels, as in Ghostty.
@@ -126,6 +153,8 @@ pub struct TerminalView {
     search_input: Option<Entity<InputState>>,
     pending_search_nav: Option<bool>,
     search_task: Option<Task<()>>,
+    attach_deadline: Instant,
+    _render_hold: Option<(Instant, Task<()>)>,
     _reader: Option<Task<()>>,
 }
 
@@ -168,6 +197,13 @@ pub fn initial_display(window: &Window) -> serde_json::Value {
 }
 
 impl Grid {
+    fn ready_to_attach(&mut self) {
+        self.attach_ready = true;
+        if let Some(ready) = self.fit_ready.take() {
+            let _ = ready.try_send(());
+        }
+    }
+
     fn refresh_theme(&mut self, theme: &vt::Theme, cell: (u32, u32)) {
         self.vt.set_theme(theme.clone());
         if let Some(chan) = self.channel
@@ -184,6 +220,7 @@ impl Grid {
         let dev = device_cell(cell, scale);
         // Before the size, so a program woken by it asks for the new cell.
         self.refresh_theme(&vt::theme(), dev);
+        self.ready_to_attach();
         if (cols, rows) == (self.vt.cols, self.vt.rows) && dev == self.vt_cell {
             return;
         }
@@ -221,9 +258,9 @@ fn track_mouse_button(buttons: &mut Vec<MouseButton>, action: GhosttyMouseAction
 }
 
 impl TerminalView {
-    /// Attaches at `size` (cols, rows): the terminal's current size, so attaching
-    /// a hidden terminal doesn't resize its program.
+    /// Waits for pane layout before replay, bounded so an unpainted view still attaches.
     pub fn attach(core: Arc<Core>, address: String, size_hint: (u16, u16), cx: &mut Context<Self>) -> Self {
+        let attach_deadline = cx.background_executor().now() + Duration::from_millis(100);
         let mut view = TerminalView {
             address: address.clone(),
             title: address.clone(),
@@ -240,6 +277,8 @@ impl TerminalView {
                 vt: Vt::new(size_hint.0.max(2), size_hint.1.max(1)),
                 core: core.clone(),
                 channel: None,
+                attach_ready: false,
+                fit_ready: None,
                 cell: size(px(9.0), px(18.0)),
                 scale: 1.0,
                 vt_cell: (9, 18),
@@ -269,9 +308,11 @@ impl TerminalView {
             search_input: None,
             pending_search_nav: None,
             search_task: None,
+            attach_deadline,
+            _render_hold: None,
             _reader: None,
         };
-        view.connect(core, false, cx);
+        view.connect(core, cx);
         view
     }
 
@@ -282,7 +323,7 @@ impl TerminalView {
         }
         self.ended = None;
         self.lost = false;
-        self.connect(core, true, cx);
+        self.connect(core, cx);
         cx.notify();
     }
 
@@ -293,9 +334,9 @@ impl TerminalView {
 
     /// Attaches off the UI thread: a terminal on a machine still dialing can
     /// take seconds, and the window must keep drawing meanwhile.
-    /// `announce_end`: emit Ended if the terminal turns out to be gone.
-    fn connect(&mut self, core: Arc<Core>, announce_end: bool, cx: &mut Context<Self>) {
-        let (cols, rows, facts) = {
+    fn connect(&mut self, core: Arc<Core>, cx: &mut Context<Self>) {
+        self._render_hold = None;
+        let fit_ready = {
             let mut g = self.grid.borrow_mut();
             let (cols, rows) = (g.vt.cols, g.vt.rows);
             // The core repaints the whole screen (and history) on attach.
@@ -307,26 +348,61 @@ impl TerminalView {
             }
             g.vt_cell = cell;
             g.told_display = None;
-            let facts = display_update(&mut g.told_display, &vt::theme(), cell).unwrap();
             g.core = core.clone();
             g.channel = None;
-            (cols, rows, facts)
+            if g.attach_ready {
+                None
+            } else {
+                let (ready, wait) = async_channel::bounded(1);
+                g.fit_ready = Some(ready);
+                Some(wait)
+            }
         };
         let address = self.address.clone();
+        let deadline = cx.background_executor().timer(self.attach_deadline.saturating_duration_since(cx.background_executor().now()));
         // Replacing the task drops an attach still in flight for an older connection.
         self._reader = Some(cx.spawn(async move |this, cx| {
+            if let Some(ready) = fit_ready {
+                let mut ready = std::pin::pin!(ready.recv());
+                let mut deadline = std::pin::pin!(deadline);
+                std::future::poll_fn(|cx| {
+                    if ready.as_mut().poll(cx).is_ready() || deadline.as_mut().poll(cx).is_ready() {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                }).await;
+            }
+            let Ok((cols, rows, facts)) = this.update(cx, |this, _| {
+                let mut g = this.grid.borrow_mut();
+                g.ready_to_attach();
+                let cell = device_cell(g.cell, g.scale);
+                let facts = display_update(&mut g.told_display, &vt::theme(), cell).unwrap();
+                (g.vt.cols, g.vt.rows, facts)
+            }) else { return };
             let attached = cx.background_executor().spawn(async move { core.attach(&address, cols, rows, facts) }).await;
-            let Ok(Some(rx)) = this.update(cx, |this, cx| this.attached(attached, (cols, rows), announce_end, cx)) else {
+            let Ok(Some(rx)) = this.update(cx, |this, cx| this.attached(attached, (cols, rows), cx)) else {
                 return;
             };
+            // Keep the first history paint together; live output gets the shorter budget.
+            let mut budget = Duration::from_millis(250);
             while let Ok(first) = rx.recv().await {
-                let mut batch = vec![first];
-                while let Ok(more) = rx.try_recv() {
-                    batch.push(more);
-                }
-                let alive = this.update(cx, |this, cx| this.ingest(batch, cx));
+                let alive = this.update(cx, |this, cx| this.ingest(output_turn(first, &rx, budget), cx));
+                budget = OUTPUT_TIME_PER_TURN;
                 if !matches!(alive, Ok(true)) {
                     break;
+                }
+                if !rx.is_empty() {
+                    // A ready receiver does not yield to input and painting.
+                    let mut yielded = false;
+                    std::future::poll_fn(|cx| {
+                        if std::mem::replace(&mut yielded, true) {
+                            Poll::Ready(())
+                        } else {
+                            cx.waker().wake_by_ref();
+                            Poll::Pending
+                        }
+                    }).await;
                 }
             }
         }));
@@ -336,7 +412,6 @@ impl TerminalView {
         &mut self,
         attached: anyhow::Result<crate::hc::Attached>,
         attached_size: (u16, u16),
-        announce_end: bool,
         cx: &mut Context<Self>,
     ) -> Option<async_channel::Receiver<Stream>> {
         cx.notify();
@@ -344,15 +419,18 @@ impl TerminalView {
             Ok(attached) => {
                 self.lost = false;
                 let mut g = self.grid.borrow_mut();
+                // Replay uses the size requested by attach, not a newer pane layout.
+                if (g.vt.cols, g.vt.rows) != attached_size {
+                    g.core.detach(attached.channel);
+                    let core = g.core.clone();
+                    drop(g);
+                    self.connect(core, cx);
+                    return None;
+                }
                 g.channel = Some(attached.channel);
                 // The theme or cell may have changed while the attach was in flight.
                 let cell = device_cell(g.cell, g.scale);
                 g.refresh_theme(&vt::theme(), cell);
-                // The pane may have been laid out while the attach was in flight.
-                let now = (g.vt.cols, g.vt.rows);
-                if now != attached_size {
-                    g.core.resize(attached.channel, now.0, now.1);
-                }
                 drop(g);
                 if let Some(t) = attached.terminal.get("title").and_then(|t| t.as_str()).filter(|t| !t.is_empty()) {
                     self.set_title(t, cx);
@@ -372,10 +450,8 @@ impl TerminalView {
                 None
             }
             Err(e) => {
+                // A failed lookup or reconnect is not evidence the program exited.
                 self.ended = Some(format!("{e:#}"));
-                if announce_end {
-                    cx.emit(TerminalEvent::Ended);
-                }
                 None
             }
         }
@@ -392,7 +468,7 @@ impl TerminalView {
     fn set_title(&mut self, title: &str, cx: &mut Context<Self>) {
         let shown = shown_title(title);
         if shown != self.title {
-            self.title = shown.to_owned();
+            self.title = shown.into_owned();
             cx.emit(TerminalEvent::TitleChanged);
         }
     }
@@ -435,7 +511,7 @@ impl TerminalView {
     }
 
     /// Feeds relayed bytes in; returns false once the stream is over.
-    fn ingest(&mut self, batch: Vec<Stream>, cx: &mut Context<Self>) -> bool {
+    fn ingest(&mut self, batch: impl IntoIterator<Item = Stream>, cx: &mut Context<Self>) -> bool {
         let mut open = true;
         let title = {
             let mut g = self.grid.borrow_mut();
@@ -483,6 +559,19 @@ impl TerminalView {
         if !open {
             self.exit_copy_mode(cx);
             cx.emit(TerminalEvent::Ended);
+        }
+        // GPUI can retain this pane's drawing while other panes paint.
+        // Wake it at the sync deadline even if the program sends no more bytes.
+        let deadline = self.grid.borrow().vt.render_hold_deadline();
+        if self._render_hold.as_ref().map(|(deadline, _)| *deadline) != deadline {
+            self._render_hold = deadline.map(|deadline| (deadline, cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(deadline.saturating_duration_since(Instant::now())).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.shown_in.get() == FRAME.load(Ordering::Relaxed) {
+                        cx.notify();
+                    }
+                });
+            })));
         }
         // Output in a terminal nobody sees doesn't redraw the window; it's
         // drawn fresh when shown again. Nor does output that changed nothing
@@ -554,6 +643,7 @@ impl TerminalView {
     /// gets each file copied there first (`hc put`), and its path there.
     fn dropped(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
         if !self.address.contains('/') {
+            let paths = stage_temporary_screenshot(&paths).unwrap_or(paths);
             let text = quote_paths(paths.iter().map(|p| p.to_string_lossy().into_owned()));
             let bytes = self.grid.borrow().vt.paste_bytes(&text);
             return self.send(&bytes);
@@ -984,7 +1074,7 @@ impl TerminalView {
         let up = steps.y > 0;
         if g.vt.mouse_tracking() {
             let ((x, y), size) = mouse_at(&g, ev.position);
-            let out = scroll_mouse_bytes(&mut g.vt, steps, x, y, size);
+            let out = scroll_mouse_bytes(&mut g.vt, steps, ev.modifiers, x, y, size);
             if let Some(ch) = g.channel {
                 g.core.input(ch, &out);
             }
@@ -1041,7 +1131,7 @@ impl TerminalView {
         });
         let ((x, y), size) = mouse_at(&g, pos);
         let any = !g.buttons_down.is_empty();
-        let bytes = g.vt.encode_mouse(action, b, 0, x, y, size, any);
+        let bytes = g.vt.encode_mouse(action, b, mouse_mods(mods), x, y, size, any);
         if let Some(ch) = g.channel {
             g.core.input(ch, &bytes);
         }
@@ -1229,9 +1319,11 @@ fn scrollbar_row_at(total: u64, len: u64, track: f32, min: f32, top: f32) -> usi
 }
 
 /// A title as it's shown: an agent's spinner in front of it (`\u{2733} Fix the
-/// tests`, braille dots) is no part of it. Herdr draws its own, and a title
-/// that spins would redraw every mod that shows titles, 10 times a second.
-pub(crate) fn shown_title(title: &str) -> &str {
+/// tests`, braille dots) is no part of it, nor braille dots after a short
+/// prefix (`\u{03c0} \u{2839} task`). Herdr draws its own, and a title that
+/// spins would redraw every mod that shows titles, 10 times a second.
+pub(crate) fn shown_title(title: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     // Frames agents spin, not status icons (\u{2713} build stays): braille dots,
     // Claude Code's stars and its half circles.
     let spinner = |c: char| {
@@ -1239,7 +1331,20 @@ pub(crate) fn shown_title(title: &str) -> &str {
     };
     let rest = title.trim_start_matches(|c: char| spinner(c) || c.is_whitespace());
     let led = title.len() - rest.len();
-    if rest.is_empty() || !title[..led].chars().any(spinner) || !title[..led].ends_with(char::is_whitespace) { title } else { rest }
+    if !rest.is_empty() && title[..led].chars().any(spinner) && title[..led].ends_with(char::is_whitespace) {
+        return Cow::Borrowed(rest);
+    }
+    let braille = |w: &str| !w.is_empty() && w.chars().all(|c| matches!(c, '\u{2800}'..='\u{28ff}'));
+    let mut words = title.splitn(3, ' ');
+    match (words.next(), words.next()) {
+        (Some(prefix), Some(frame)) if !prefix.is_empty() && prefix.chars().count() <= 3 && !braille(prefix) && braille(frame) => {
+            match words.next().map(str::trim_start).filter(|r| !r.is_empty()) {
+                Some(rest) => Cow::Owned(format!("{prefix} {rest}")),
+                None => Cow::Borrowed(prefix),
+            }
+        }
+        _ => Cow::Borrowed(title),
+    }
 }
 
 /// Paths as a shell reads them, space-separated with a trailing space: bare
@@ -1254,6 +1359,60 @@ fn quote_paths(paths: impl IntoIterator<Item = String>) -> String {
     let mut out: String = paths.into_iter().map(quote).collect::<Vec<_>>().join(" ");
     out.push(' ');
     out
+}
+
+/// A live macOS screenshot thumbnail, dropped before it saved.
+///
+/// macOS writes such an image into a private `NSIRD_*` directory under
+/// `TemporaryItems` and grants read access to it only to the app that received
+/// the drop, and only until the thumbnail saves.
+fn is_temporary_screenshot(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    path.ancestors().skip(1).any(|directory| {
+        directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("NSIRD_"))
+            && directory
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == "TemporaryItems")
+    })
+}
+
+/// Whether these bytes are an image the pane can open.
+fn is_image_bytes(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n") || bytes.starts_with(&[0xff, 0xd8, 0xff])
+}
+
+/// Copies a live screenshot thumbnail somewhere a pane can read, and pastes
+/// that path instead.
+///
+/// macOS gives read access to the thumbnail's temporary file only to the app
+/// that received the drop; a pane's processes are children of the Herdr
+/// daemon, not of this app, so they cannot open it, and the file is gone
+/// within seconds. This app can read it now, so it copies the bytes into the
+/// temp directory and the pane gets a path that stays readable.
+fn stage_temporary_screenshot(paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
+    let [path] = paths else {
+        return None;
+    };
+    if !is_temporary_screenshot(path) {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if !is_image_bytes(&bytes) {
+        return None;
+    }
+    let directory = std::env::temp_dir().join("herdr-drops");
+    std::fs::create_dir_all(&directory).ok()?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis();
+    let name = path.file_name()?.to_str()?;
+    let staged = directory.join(format!("{stamp}-{name}"));
+    std::fs::write(&staged, &bytes).ok()?;
+    Some(vec![staged])
 }
 
 /// Files on the clipboard: their text is only the bare path, which an agent
@@ -1297,6 +1456,20 @@ fn paste_image_bytes(format: ImageFormat, bytes: &[u8]) -> Option<(ImageFormat, 
     Some((ImageFormat::Png, std::borrow::Cow::Owned(png.into_inner())))
 }
 
+fn mouse_mods(m: Modifiers) -> GhosttyMods {
+    let mut mods = 0;
+    if m.shift {
+        mods |= GHOSTTY_MODS_SHIFT as GhosttyMods;
+    }
+    if m.alt {
+        mods |= GHOSTTY_MODS_ALT as GhosttyMods;
+    }
+    if m.control {
+        mods |= GHOSTTY_MODS_CTRL as GhosttyMods;
+    }
+    mods
+}
+
 fn link_mods(m: &Modifiers) -> bool {
     let key = if cfg!(target_os = "macos") { m.platform && !m.control } else { m.control && !m.platform };
     key && !m.alt && !m.shift
@@ -1316,7 +1489,7 @@ fn scroll_delta_steps(scrolled: &mut Point<f32>, delta: ScrollDelta, phase: Touc
     point(scroll_steps(&mut scrolled.x, phase, lines.x, cols as f32), scroll_steps(&mut scrolled.y, phase, lines.y, rows as f32))
 }
 
-fn scroll_mouse_bytes(vt: &mut Vt, steps: Point<i32>, x: f32, y: f32, size: (u32, u32, f32, f32)) -> Vec<u8> {
+fn scroll_mouse_bytes(vt: &mut Vt, steps: Point<i32>, mods: Modifiers, x: f32, y: f32, size: (u32, u32, f32, f32)) -> Vec<u8> {
     let mut out = Vec::new();
     for (steps, positive, negative) in [
         (steps.y, GHOSTTY_MOUSE_BUTTON_FOUR, GHOSTTY_MOUSE_BUTTON_FIVE),
@@ -1324,7 +1497,7 @@ fn scroll_mouse_bytes(vt: &mut Vt, steps: Point<i32>, x: f32, y: f32, size: (u32
     ] {
         let button = if steps > 0 { positive } else { negative };
         for _ in 0..steps.unsigned_abs() {
-            out.extend(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), 0, x, y, size, false));
+            out.extend(vt.encode_mouse(GHOSTTY_MOUSE_ACTION_PRESS, Some(button), mouse_mods(mods), x, y, size, false));
         }
     }
     out
@@ -1706,7 +1879,7 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, cursor: Option<usize>, window: 
                 x += 1;
             }
         }
-        if text.trim().is_empty() && !c.underline && !c.strike {
+        if text.trim_matches(' ').is_empty() && !c.underline && !c.strike {
             continue;
         }
         if ligatures && needs_ligatures(&text, &text_font) {
@@ -2375,6 +2548,121 @@ impl Focusable for TerminalView {
 mod tests {
     use super::{ScrollTarget, pages_to_lines, scroll_target};
     use serde_json::{Value, json};
+
+    #[test]
+    fn output_turns_preserve_bytes_budget_and_close_order() {
+        use crate::hc::Stream;
+        use std::time::Duration;
+
+        let (tx, rx) = async_channel::unbounded();
+        let payload: Vec<u8> = (0..50_000).map(|n| n as u8).collect();
+        for chunk in payload.chunks(997) {
+            tx.try_send(Stream::Data(chunk.to_vec())).unwrap();
+        }
+        tx.try_send(Stream::Closed(json!({"reason": "exited"}))).unwrap();
+        drop(tx);
+        let first = rx.try_recv().unwrap();
+        let mut turn = super::output_turn(first, &rx, Duration::ZERO);
+        let Some(Stream::Data(first)) = turn.next() else { panic!("missing first frame") };
+        assert!(turn.next().is_none(), "an expired turn must leave queued data for later");
+        let mut received = first;
+        let mut ended = false;
+        while let Ok(first) = rx.try_recv() {
+            for item in super::output_turn(first, &rx, Duration::from_secs(1)) {
+                match item {
+                    Stream::Data(bytes) => {
+                        assert!(!ended, "data overtook the close event");
+                        received.extend_from_slice(&bytes);
+                    }
+                    Stream::Closed(why) => {
+                        assert_eq!(why["reason"], "exited");
+                        assert_eq!(received, payload);
+                        ended = true;
+                    }
+                    Stream::Lost => panic!("unexpected lost connection"),
+                }
+            }
+        }
+        assert!(ended);
+        assert!(rx.is_closed() && rx.is_empty());
+    }
+
+    #[gpui::test]
+    fn attach_errors_do_not_announce_a_terminal_exit(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        let view = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "remote/t1".into(), (40, 5), cx));
+        let ends = cx.new(|cx| {
+            cx.subscribe(&view, |count: &mut usize, _, event: &super::TerminalEvent, _| {
+                if matches!(event, super::TerminalEvent::Ended) {
+                    *count += 1;
+                }
+            }).detach();
+            0usize
+        });
+        cx.run_until_parked();
+        for kind in ["not_found", "unavailable", "permission_denied"] {
+            view.update(cx, |view, cx| {
+                let error = crate::hc::RpcError(json!({ "message": "attach failed", "data": { "kind": kind } }));
+                view.attached(Err(error.into()), (40, 5), cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(ends.read_with(cx, |count, _| *count), 0, "{kind}");
+        }
+        view.update(cx, |view, cx| {
+            let error = crate::hc::RpcError(json!({ "message": "program finished", "data": { "kind": "finished" } }));
+            view.attached(Err(error.into()), (40, 5), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(ends.read_with(cx, |count, _| *count), 1);
+    }
+
+    #[gpui::test]
+    fn terminal_attaches_only_after_its_first_fit(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (120, 40), cx));
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| assert!(!terminal.lost, "must not contact the core before layout"));
+        terminal.update(cx, |terminal, _| terminal.fit(114, 30, size(px(8.), px(18.)), 1.));
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
+            assert!(terminal.lost, "the fitted pane must attempt to attach");
+            assert_eq!(terminal.dimensions(), (114, 30));
+        });
+    }
+
+    #[gpui::test]
+    fn an_unpainted_terminal_attaches_at_its_creation_deadline(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (120, 40), cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(std::time::Duration::from_millis(99));
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| assert!(!terminal.lost));
+        cx.executor().advance_clock(std::time::Duration::from_millis(1));
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
+            assert!(terminal.lost, "an unpainted view must not wait forever");
+            assert_eq!(terminal.dimensions(), (120, 40));
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_discards_replay_for_an_outdated_pane_size(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (120, 40), cx));
+        let (tx, rx) = async_channel::unbounded();
+        terminal.update(cx, |terminal, cx| {
+            terminal.fit(114, 30, size(px(8.), px(18.)), 1.);
+            let attached = crate::hc::Attached { channel: 7, stream: rx, terminal: json!({"title": "outdated replay"}) };
+            assert!(terminal.attached(Ok(attached), (120, 40), cx).is_none());
+            assert!(terminal.grid.borrow().channel.is_none());
+            assert_ne!(terminal.title, "outdated replay");
+            assert!(tx.is_closed(), "the wrong-sized replay must not be consumed");
+        });
+    }
 
     #[gpui::test]
     fn separate_window_output_redraws_after_main_window_frame(cx: &mut gpui::TestAppContext) {
@@ -3161,6 +3449,30 @@ mod tests {
     }
 
     #[gpui::test]
+    fn unicode_spaces_are_shaped_but_blank_cells_are_skipped(cx: &mut gpui::TestAppContext) {
+        use super::*;
+        let window = cx.add_window(|_, _| Empty);
+        window.update(cx, |_, window, _| {
+            for (text, wide) in [("\u{3000}", true), ("\u{a0}", false), ("\u{2003}", false)] {
+                let row = [vt::Cell { text: text.into(), wide, ..Default::default() }, vt::Cell::default()];
+                let ops = row_ops(&row, size(px(8.), px(16.)), None, window);
+                let runs: Vec<_> = ops.iter().filter_map(|op| match op {
+                    RowOp::Text { x, line } => Some((*x, line.text.as_ref())),
+                    _ => None,
+                }).collect();
+                assert_eq!(runs, vec![(0, text)]);
+            }
+            for text in ["", " ", "   "] {
+                for (underline, strike) in [(false, false), (true, false), (false, true)] {
+                    let row = [vt::Cell { text: text.into(), underline, strike, ..Default::default() }];
+                    let ops = row_ops(&row, size(px(8.), px(16.)), None, window);
+                    assert_eq!(ops.iter().filter(|op| matches!(op, RowOp::Text { .. })).count(), usize::from(underline || strike));
+                }
+            }
+        }).unwrap();
+    }
+
+    #[gpui::test]
     fn ligatures_off_keeps_one_style_run_across_backgrounds(cx: &mut gpui::TestAppContext) {
         use super::*;
         let original = crate::settings::get();
@@ -3401,9 +3713,64 @@ mod tests {
         assert_eq!(shown_title("\u{2717} build"), "\u{2717} build");
     }
 
+    #[test]
+    fn a_spinner_after_a_short_prefix_is_not_part_of_it() {
+        use super::shown_title;
+        assert_eq!(shown_title("\u{03c0} \u{2839} fix the tests"), "\u{03c0} fix the tests", "omp's");
+        assert_eq!(shown_title("\u{03c0} \u{2827} fix the tests"), "\u{03c0} fix the tests", "every frame alike");
+        assert_eq!(shown_title("\u{03c0} \u{2839}"), "\u{03c0}", "nothing after it");
+        assert_eq!(shown_title("\u{2839} fix the tests"), "fix the tests", "codex's, in front");
+        assert_eq!(shown_title("\u{2733} Fix the tests"), "Fix the tests", "Claude Code's");
+        assert_eq!(shown_title("repo \u{00b7} branch"), "repo \u{00b7} branch", "a middle dot between words stays");
+        assert_eq!(shown_title("\u{03c0} \u{00b7} task"), "\u{03c0} \u{00b7} task", "only braille after a prefix");
+        assert_eq!(shown_title("herdr \u{2839} task"), "herdr \u{2839} task", "a word is no prefix");
+        assert_eq!(shown_title("\u{2839}"), "\u{2839}", "only a spinner: kept");
+        assert_eq!(shown_title("\u{2839} \u{2838}"), "\u{2839} \u{2838}");
+    }
+
     use super::key_bytes;
     use crate::vt::Vt;
     use gpui::{KeyDownEvent, Keystroke, Modifiers};
+
+    #[test]
+    fn mouse_modifiers_reach_clicks_drags_and_wheels_in_each_encoding() {
+        use ghostty_sys::*;
+        let size = (80, 24, 10.0, 20.0);
+        for mode in [0, 1005, 1006, 1015, 1016] {
+            for (mods, bits) in [
+                (Modifiers::default(), 0),
+                (Modifiers { shift: true, ..Modifiers::default() }, 4),
+                (Modifiers { alt: true, ..Modifiers::default() }, 8),
+                (Modifiers { control: true, ..Modifiers::default() }, 16),
+                (Modifiers { shift: true, alt: true, control: true, ..Modifiers::default() }, 28),
+            ] {
+                let mut vt = Vt::new(80, 24);
+                vt.write(b"\x1b[?1002h");
+                if mode != 0 {
+                    vt.write(format!("\x1b[?{mode}h").as_bytes());
+                }
+                let expected = |button: u8, release, x: u8| match mode {
+                    1006 => format!("\x1b[<{};{};2{}", button + bits, x / 10 + 1, if release { 'm' } else { 'M' }).into_bytes(),
+                    1016 => format!("\x1b[<{};{x};25{}", button + bits, if release { 'm' } else { 'M' }).into_bytes(),
+                    1015 => format!("\x1b[{};{};2M", if release { 3 } else { button } + bits + 32, x / 10 + 1).into_bytes(),
+                    _ => vec![0x1b, b'[', b'M', if release { 3 } else { button } + bits + 32, x / 10 + 33, 34],
+                };
+                for (action, button, release, x) in [
+                    (GHOSTTY_MOUSE_ACTION_PRESS, 0, false, 15),
+                    (GHOSTTY_MOUSE_ACTION_MOTION, 32, false, 25),
+                    (GHOSTTY_MOUSE_ACTION_RELEASE, 0, true, 25),
+                ] {
+                    assert_eq!(
+                        vt.encode_mouse(action, Some(GHOSTTY_MOUSE_BUTTON_LEFT), super::mouse_mods(mods), x as f32, 25.0, size, true),
+                        expected(button, release, x),
+                        "mode {mode}, modifiers {bits}, action {action}",
+                    );
+                }
+                let wheels = super::scroll_mouse_bytes(&mut vt, gpui::point(1, 1), mods, 15.0, 25.0, size);
+                assert_eq!(wheels, [expected(64, false, 15), expected(66, false, 15)].concat(), "mode {mode}, modifiers {bits}");
+            }
+        }
+    }
 
     #[test]
     fn touchpad_moves_add_up_to_whole_lines() {
@@ -3432,12 +3799,12 @@ mod tests {
             (point(-10.0, 20.0), b"\x1b[<64;2;2M\x1b[<67;2;2M".as_slice()),
         ] {
             let steps = super::scroll_delta_steps(&mut scrolled, ScrollDelta::Pixels(point(px(delta.x), px(delta.y))), TouchPhase::Moved, cell, 80, 24);
-            assert_eq!(super::scroll_mouse_bytes(&mut vt, steps, 15.0, 25.0, (80, 24, 10.0, 20.0)), expected);
+            assert_eq!(super::scroll_mouse_bytes(&mut vt, steps, Modifiers::default(), 15.0, 25.0, (80, 24, 10.0, 20.0)), expected);
         }
         let steps = super::scroll_delta_steps(&mut scrolled, ScrollDelta::Lines(point(1.0, -1.0)), TouchPhase::Moved, cell, 80, 24);
         let count = if cfg!(target_os = "macos") { 3 } else { 1 };
         assert_eq!(steps, point(1, -count));
-        assert_eq!(super::scroll_mouse_bytes(&mut vt, steps, 15.0, 25.0, (80, 24, 10.0, 20.0)), [b"\x1b[<65;2;2M".repeat(count as usize), b"\x1b[<66;2;2M".to_vec()].concat());
+        assert_eq!(super::scroll_mouse_bytes(&mut vt, steps, Modifiers::default(), 15.0, 25.0, (80, 24, 10.0, 20.0)), [b"\x1b[<65;2;2M".repeat(count as usize), b"\x1b[<66;2;2M".to_vec()].concat());
     }
 
     #[test]
@@ -3524,6 +3891,45 @@ mod tests {
         assert_eq!(q(&["/tmp/shot.png"]), "/tmp/shot.png ");
         assert_eq!(q(&["/tmp/my shot.png", "/a/b"]), "'/tmp/my shot.png' /a/b ");
         assert_eq!(q(&["/tmp/it's.png"]), "'/tmp/it'\\''s.png' ");
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_screenshot_thumbnail_is_staged_where_a_pane_can_read_it() {
+        use super::{is_temporary_screenshot, stage_temporary_screenshot};
+        let root = std::env::temp_dir().join(format!("herdr-drop-test-{}", std::process::id()));
+        let thumbnail = root.join("T/TemporaryItems/NSIRD_screencaptureui_vKTdfp/Screenshot 2026-10-16 at 2.09.54 PM.png");
+        std::fs::create_dir_all(thumbnail.parent().unwrap()).unwrap();
+        std::fs::write(&thumbnail, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        assert!(is_temporary_screenshot(&thumbnail));
+        let staged = stage_temporary_screenshot(std::slice::from_ref(&thumbnail)).expect("staged");
+        assert_eq!(staged.len(), 1);
+        assert!(staged[0].starts_with(std::env::temp_dir().join("herdr-drops")));
+        assert_ne!(staged[0], thumbnail);
+        assert_eq!(std::fs::read(&staged[0]).unwrap(), b"\x89PNG\r\n\x1a\nrest");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&staged[0]).ok();
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn other_drops_are_left_alone() {
+        use super::{is_temporary_screenshot, stage_temporary_screenshot};
+        // A saved screenshot is readable by the pane's processes.
+        assert!(!is_temporary_screenshot(&std::path::PathBuf::from("/Users/me/Desktop/Screenshot.png")));
+        // A look-alike directory, the wrong parent, and a relative path.
+        assert!(!is_temporary_screenshot(&std::path::PathBuf::from("/T/TemporaryItems/NSIRDx/a.png")));
+        assert!(!is_temporary_screenshot(&std::path::PathBuf::from("/T/Items/NSIRD_screencaptureui_x/a.png")));
+        assert!(!is_temporary_screenshot(&std::path::PathBuf::from("TemporaryItems/NSIRD_x/a.png")));
+        // One file at a time: a multi-file drop keeps its paths.
+        let many = vec![std::path::PathBuf::from("/a.png"), std::path::PathBuf::from("/b.png")];
+        assert!(stage_temporary_screenshot(&many).is_none());
+        // A file that is not an image is not staged either.
+        let notes = std::env::temp_dir().join("T/TemporaryItems/NSIRD_x/notes.txt");
+        std::fs::create_dir_all(notes.parent().unwrap()).unwrap();
+        std::fs::write(&notes, b"hello").unwrap();
+        assert!(stage_temporary_screenshot(std::slice::from_ref(&notes)).is_none());
+        std::fs::remove_dir_all(notes.parent().unwrap().parent().unwrap()).ok();
     }
 
     #[test]
