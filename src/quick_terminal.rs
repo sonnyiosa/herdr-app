@@ -399,6 +399,12 @@ mod native {
             unsafe {
                 if animation.sequence.get() == sequence {
                     animation.running.set(false);
+                    let is_key: unsafe extern "C" fn(*mut c_void, *const c_void) -> bool = std::mem::transmute(objc_msgSend as *const ());
+                    if desired && !is_key(window, sel_registerName(c"isKeyWindow".as_ptr())) {
+                        // App activation completes after makeKeyAndOrderFront: and can give key status back to another window.
+                        let f: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) = std::mem::transmute(objc_msgSend as *const ());
+                        f(window, sel_registerName(c"makeKeyAndOrderFront:".as_ptr()), std::ptr::null_mut());
+                    }
                     if !desired {
                         let f: unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void) = std::mem::transmute(objc_msgSend as *const ());
                         f(window, sel_registerName(c"orderOut:".as_ptr()), std::ptr::null_mut());
