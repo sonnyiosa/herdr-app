@@ -736,8 +736,16 @@ export default class Settings extends View {
             : u.checks
               ? [result, check("st-check-core")]
               : ["Not checked: a build from source looks for no updates.", null];
+    const auto = u.auto;
     return v_flex()
       .w_full()
+      .child(this.heading(t, "Automatic updates"))
+      .child(this.row(t, "Check for updates automatically", "Herdr looks every hour and downloads what it finds. Off: it only looks when you press Check now.", this.toggle(t, "st-auto-update", auto, (_e, cx) =>
+        this.change((p) => {
+          if (auto) p.auto_update = false;
+          else delete p.auto_update;
+        }, cx))))
+      .child(div().h(18))
       .child(this.heading(t, "Herdr"))
       .child(this.row(t, `Herdr ${u.app.version}`, app[0], h_flex().gap(8).flex_none()
         .child(this.button(t, "st-whats-new", "What's new", () => { closeOverlay(props()?.overlay); run("app.whats_new"); }))
@@ -745,7 +753,7 @@ export default class Settings extends View {
       .child(div().h(18))
       .child(this.heading(t, "herdr-core"))
       .child(this.row(t, `herdr-core ${c.version ?? ""}`, core[0], core[1] ?? div()))
-      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child("Herdr looks for both every hour and tells you in the corner. herdr-core runs your terminals, so they keep running through its updates."));
+      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child(`${auto ? "Herdr looks for both every hour and tells you in the corner." : "Herdr looks for updates only when you press Check now."} herdr-core runs your terminals, so they keep running through its updates.`));
   }
 
 

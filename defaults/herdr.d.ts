@@ -294,6 +294,8 @@ export function updates(): {
   checked: number | null;
   checks: boolean;
   checking: boolean;
+  /** settings.json's `auto_update`: false stops the hourly looks. */
+  auto: boolean;
 };
 
 /** Record only spotlight versions actually shown expanded, never collapsed headlines. */

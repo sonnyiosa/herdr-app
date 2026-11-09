@@ -144,6 +144,7 @@ fn main() {
     if core.is_ok() {
         update::after_update();
     }
+    update::set_auto(settings::auto_update_setting(&person));
     update::start();
     telemetry::start(settings::telemetry_setting(&person));
     bench::start();
