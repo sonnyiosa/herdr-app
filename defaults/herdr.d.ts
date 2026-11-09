@@ -292,6 +292,8 @@ export function updates(): {
   notes: { version: string; date: string; items: { headline: string; detail: string; fixed: boolean; media: { path: string; width: number; height: number }[] }[]; spotlight: boolean }[];
   core: { version: string | null; managed: string | null; ready: string | null; updating: boolean; error: string | null };
   checked: number | null;
+  app_checked: number | null;
+  core_checked: number | null;
   checks: boolean;
   checking: boolean;
   /** settings.json's `auto_update`: false stops the hourly looks. */

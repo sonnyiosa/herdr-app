@@ -20,7 +20,7 @@ prints the built-in command list even without an open window. Do not launch bare
 signal or restart the person's app or core. A window closing does not kill
 its terminals.
 
-`app.check_updates` checks for newer releases. Settings reports "Up to date"
+`app.check_updates` checks for newer releases. Pass `target: "app"` or `target: "core"` to check one; omit it to check both. Settings reports "Up to date"
 only after a successful check; on failure, check the connection and retry.
 
 On macOS, set `quick_terminal_shortcut` in settings.json to an opt-in

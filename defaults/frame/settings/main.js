@@ -698,23 +698,26 @@ export default class Settings extends View {
       const d = new Date(secs * 1000);
       return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
     };
-    const checked = u.checked ? ` Checked at ${at(u.checked)}.` : "";
-    const result = u.checking ? "Checking\u2026" : u.checked
-      ? `Up to date.${checked}`
-      : "No successful check. Check your connection and try again.";
+    const result = (target) => {
+      const checked = u[`${target}_checked`] === undefined ? u.checked : u[`${target}_checked`];
+      return u.checking && (!this.asked || !this.askedTarget || this.askedTarget === target) ? "Checking\u2026" : checked
+        ? `Up to date. Checked at ${at(checked)}.`
+        : "No successful check. Check your connection and try again.";
+    };
     // Pressed: "Checking\u2026" while it looks, then "Up to date" for a moment
     // (a find changes the row instead). One per row: an element shows once.
     const asked = this.asked && Date.now() - this.asked < 3000;
-    const check = (id) =>
+    const check = (id, target) =>
       !u.checks
         ? null
-        : u.checking && this.asked
+        : u.checking && this.asked && this.askedTarget === target
           ? div().px(12).py(5).text_size(13).text_color(t.dim).child("Checking\u2026")
-          : asked && u.checked && !u.checking
+          : asked && this.askedTarget === target && (u[`${target}_checked`] === undefined ? u.checked : u[`${target}_checked`]) && !u.checking
             ? div().px(12).py(5).text_size(13).text_color(t.ansi2).child("\u2713 Up to date")
             : this.button(t, id, "Check now", (_e, cx) => {
                 this.asked = Date.now();
-                run("app.check_updates");
+                this.askedTarget = target;
+                run("app.check_updates", { target });
                 cx.notify();
               });
     const primary = (id, label, f) =>
@@ -723,7 +726,7 @@ export default class Settings extends View {
       ? ["A build from source: it updates with git, not here.", null]
       : u.app.ready
         ? [`${u.app.ready} is ready. Restart to switch now; it also switches when you quit.`, primary("st-app-update", "Restart to update", () => run("app.update"))]
-        : [result, check("st-check-app")];
+        : [result("app"), check("st-check-app", "app")];
     const c = u.core;
     const core = c.managed
       ? [`Managed by ${c.managed}: update it there.`, null]
@@ -734,7 +737,7 @@ export default class Settings extends View {
           : c.ready
             ? [`${c.ready} is ready. Your terminals keep running through it.`, primary("st-core-update", "Update herdr-core", () => run("app.update_core"))]
             : u.checks
-              ? [result, check("st-check-core")]
+              ? [result("core"), check("st-check-core", "core")]
               : ["Not checked: a build from source looks for no updates.", null];
     const auto = u.auto;
     return v_flex()

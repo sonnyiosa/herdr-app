@@ -95,7 +95,11 @@ static CORE: Mutex<CoreInfo> = Mutex::new(CoreInfo { version: None, managed: Non
 /// When the last check succeeded (unix seconds); a failed check clears it.
 static CHECKED: Mutex<Option<u64>> = Mutex::new(None);
 /// "Check now" wakes the checker early.
-static WAKE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+static WAKE: (Mutex<u8>, Condvar) = (Mutex::new(0), Condvar::new());
+const APP: u8 = 1;
+const CORE_CHECK: u8 = 2;
+static APP_CHECKED: Mutex<Option<u64>> = Mutex::new(None);
+static CORE_CHECKED: Mutex<Option<u64>> = Mutex::new(None);
 /// The checker runs (a release, or pointed at a test server), and is looking right now.
 /// settings.json's `auto_update`: off stops the hourly looks (and downloads);
 /// "Check now" still works.
@@ -138,14 +142,16 @@ pub fn status() -> serde_json::Value {
         "checks": RUNNING.load(Ordering::Relaxed),
         "auto": AUTO.load(Ordering::Relaxed),
         "checking": CHECKING.load(Ordering::Relaxed),
+        "app_checked": *APP_CHECKED.lock().unwrap(),
+        "core_checked": *CORE_CHECKED.lock().unwrap(),
     })
 }
 
-pub fn check_now() {
+pub fn check_now(target: Option<&str>) {
     if RUNNING.load(Ordering::Relaxed) {
         CHECKING.store(true, Ordering::Relaxed);
     }
-    *WAKE.0.lock().unwrap() = true;
+    *WAKE.0.lock().unwrap() |= match target { Some("app") => APP, Some("core") => CORE_CHECK, _ => APP | CORE_CHECK };
     WAKE.1.notify_all();
 }
 
@@ -153,11 +159,11 @@ pub fn set_auto(on: bool) {
     AUTO.store(on, Ordering::Relaxed);
 }
 
-/// Sleeps up to `d`; true when `check_now` woke it.
-fn sleep(d: Duration) -> bool {
+/// Sleeps up to `d`; returns the requested targets, or zero on timeout.
+fn sleep(d: Duration) -> u8 {
     let woken = WAKE.0.lock().unwrap();
-    let (mut woken, _) = WAKE.1.wait_timeout_while(woken, d, |w| !*w).unwrap();
-    std::mem::replace(&mut *woken, false)
+    let (mut woken, _) = WAKE.1.wait_timeout_while(woken, d, |w| *w == 0).unwrap();
+    std::mem::replace(&mut *woken, 0)
 }
 
 /// Starts checking in the background: the app if it's an installed release, the core too.
@@ -173,16 +179,19 @@ pub fn start() {
     std::thread::spawn(move || {
         let mut asked = sleep(Duration::from_secs(10));
         loop {
-            if !AUTO.load(Ordering::Relaxed) && !asked {
+            if !AUTO.load(Ordering::Relaxed) && asked == 0 {
                 CHECKING.store(false, Ordering::Relaxed);
                 asked = sleep(EVERY);
                 continue;
             }
+            let targets = if asked == 0 { APP | CORE_CHECK } else { asked };
             CHECKING.store(true, Ordering::Relaxed);
             let mut wait = EVERY;
             let mut succeeded = true;
-            if let Some(root) = &app {
-                match check(root) {
+            if targets & APP != 0 && let Some(root) = &app {
+                let result = check(root);
+                *APP_CHECKED.lock().unwrap() = checked_at(result.is_ok(), now());
+                match result {
                     Ok(found) => {
                         if found.is_some() {
                             *READY.lock().unwrap() = found;
@@ -196,10 +205,14 @@ pub fn start() {
                     }
                 }
             }
-            if core && let Err(e) = check_core() {
-                tracing::warn!("core update check: {e}");
-                wait = RETRY;
-                succeeded = false;
+            if targets & CORE_CHECK != 0 && core {
+                let result = check_core();
+                *CORE_CHECKED.lock().unwrap() = checked_at(result.is_ok(), now());
+                if let Err(e) = result {
+                    tracing::warn!("core update check: {e}");
+                    wait = RETRY;
+                    succeeded = false;
+                }
             }
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             *CHECKED.lock().unwrap() = checked_at(succeeded, now);
@@ -207,6 +220,10 @@ pub fn start() {
             asked = sleep(wait);
         }
     });
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 fn checked_at(succeeded: bool, now: u64) -> Option<u64> {

@@ -3356,7 +3356,13 @@ impl AppWindow {
                 }
                 return;
             }
-            "app.check_updates" => crate::update::check_now(),
+            "app.check_updates" => {
+                let target = Self::owned(a, "target");
+                if target.as_deref().is_some_and(|t| !matches!(t, "app" | "core")) {
+                    return self.fail("target must be app or core");
+                }
+                crate::update::check_now(target.as_deref());
+            }
             "app.update_core" => {
                 if crate::update::core().ready.is_none() && crate::update::core().error.is_none() {
                     return self.fail("herdr-core is up to date");
