@@ -2,6 +2,14 @@
 
 Herdr is a desktop app for terminals and coding agents. Keep work in spaces, see which agents need you, and leave terminals running when you close the window.
 
+## Custom features
+
+This fork includes the following customizations:
+
+- **Quick Terminal:** Summon and hide a persistent terminal on macOS. See the [migration plan](docs/quick-terminal-plan.md), which records the original proposal and verification approach.
+- **Copy mode:** Navigate, search, and select terminal text with the keyboard. See the [copy mode specification](docs/copy-mode-spec.md).
+- **Quick Look:** Cmd+Shift-click a terminal file link to preview it on macOS. See the [Quick Look specification](docs/quick-look-spec.md).
+
 ## Install
 
 ### macOS

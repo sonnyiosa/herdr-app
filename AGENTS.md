@@ -6,6 +6,12 @@ maintains it.
 
 If AGENTS.local.md exists, read it too: the maintainer's local rules.
 
+## Fork customizations
+
+Keep the custom features list in `README.md` current when adding, changing,
+or removing a fork customization. Link each entry to its specification, and
+keep the linked document current with the behavior.
+
 ## Compatibility
 
 Preserve compatibility with released versions and installed user data.
