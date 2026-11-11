@@ -73,6 +73,10 @@ The prototype passes when all of these are true:
 
 If the prototype fails one of these checks, stop and report the result before step 2.
 
+**Result (scratch GPUI example, run on macOS).** Checks 1 and 4 pass in code: after `toggle(a)` the panel is visible and key, and `currentPreviewItem` is a's file URL; `toggle(b)` changes the item to b; `toggle(b)` again hides the panel, and a later `toggle(a)` opens it again. After the panel hides, the key window is the GPUI window again (`NSApp.keyWindow` is a `GPUIWindow`), as far as a programmatic `orderOut` and `close` show. Checks 2 and 3 need a human key press (Space, Esc) and are not proven here.
+
+**Check 5, the method.** The panel keeps a data source that `toggle` sets directly with `setDataSource:`, with no controller. The prototype ran two variants. (a) A responder object that answers `acceptsPreviewPanelControl:` and sets the data source in `beginPreviewPanelControl:`, hung on the application's `nextResponder`. (b) The direct `setDataSource:` call alone. In both, the panel is visible, `dataSource` is set and the item is right after `makeKeyAndOrderFront:`, after an explicit `updateController`, and after a close and reopen. Variant (b) works because no responder in Herdr's chain accepts control of the panel, so `updateController` finds no controller and leaves the data source alone. It needs no responder class and no change to the application object, so `src/quick_look.rs` uses (b). If a future responder in the chain accepts panel control, the panel takes its data source from that responder; move to (a) then. The panel keeps only a weak reference, so the module holds the data source object in a `thread_local`.
+
 ### 2. Replace `link_mods` with `LinkGesture`
 
 1. Add `LinkGesture`, `link_gesture` and `LinkGesture::accepts` next to `link_mods` in `src/terminal.rs`. Remove `link_mods`.
