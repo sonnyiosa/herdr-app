@@ -1470,9 +1470,39 @@ fn mouse_mods(m: Modifiers) -> GhosttyMods {
     mods
 }
 
-fn link_mods(m: &Modifiers) -> bool {
-    let key = if cfg!(target_os = "macos") { m.platform && !m.control } else { m.control && !m.platform };
-    key && !m.alt && !m.shift
+/// What a click on a link does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinkGesture {
+    Open,
+    /// Quick Look. Only macOS has it.
+    #[cfg(target_os = "macos")]
+    Preview,
+}
+
+/// What a click with these modifiers does to a link, if anything.
+fn link_gesture(m: &Modifiers) -> Option<LinkGesture> {
+    if m.alt {
+        return None;
+    }
+    if cfg!(target_os = "macos") {
+        #[cfg(target_os = "macos")]
+        if m.platform && !m.control {
+            return Some(if m.shift { LinkGesture::Preview } else { LinkGesture::Open });
+        }
+        None
+    } else {
+        (m.control && !m.platform && !m.shift).then_some(LinkGesture::Open)
+    }
+}
+
+impl LinkGesture {
+    fn accepts(self, target: &LinkTarget) -> bool {
+        match self {
+            LinkGesture::Open => true,
+            #[cfg(target_os = "macos")]
+            LinkGesture::Preview => matches!(target, LinkTarget::External(links::Target::File(_))),
+        }
+    }
 }
 
 fn local(g: &Grid, p: Point<Pixels>) -> (f32, f32) {
@@ -2228,7 +2258,8 @@ impl Render for TerminalView {
         }
         let cell = cell_size(window);
         let hover = self.grid.borrow().hover;
-        let found = hover.filter(|_| link_mods(&window.modifiers())).and_then(|pos| self.link_at(pos));
+        let gesture = link_gesture(&window.modifiers());
+        let found = hover.zip(gesture).and_then(|(pos, gesture)| self.link_at(pos).filter(|(target, _)| gesture.accepts(target)));
         let (link, spans) = found.unzip();
         self.link = link;
         self.grid.borrow_mut().link_spans = spans.unwrap_or_default();
@@ -2307,14 +2338,24 @@ impl Render for TerminalView {
             .on_mouse_down(MouseButton::Left, cx.listener(|this, ev: &MouseDownEvent, window, cx| {
                 this.exit_copy_mode(cx);
                 this.focus.focus(window, cx);
-                if link_mods(&ev.modifiers)
+                if let Some(gesture) = link_gesture(&ev.modifiers)
                     && let Some((target, _)) = this.link_at(ev.position)
+                    && gesture.accepts(&target)
                 {
-                    match target {
-                        LinkTarget::External(target) => links::open(&target),
-                        LinkTarget::Terminal(address) => cx.emit(TerminalEvent::Peek(address)),
+                    match (gesture, target) {
+                        (LinkGesture::Open, LinkTarget::External(target)) => {
+                            links::open(&target);
+                            return;
+                        }
+                        (LinkGesture::Open, LinkTarget::Terminal(address)) => {
+                            cx.emit(TerminalEvent::Peek(address));
+                            return;
+                        }
+                        #[cfg(target_os = "macos")]
+                        (LinkGesture::Preview, LinkTarget::External(links::Target::File(_))) => {}
+                        #[cfg(target_os = "macos")]
+                        (LinkGesture::Preview, _) => {}
                     }
-                    return;
                 }
                 let mut g = this.grid.borrow_mut();
                 if let (Some(track), Some(thumb)) = (g.track, g.thumb)
@@ -2361,7 +2402,7 @@ impl Render for TerminalView {
             }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 this.grid.borrow_mut().hover = Some(ev.position);
-                if link_mods(&ev.modifiers) || this.link.is_some() {
+                if link_gesture(&ev.modifiers).is_some() || this.link.is_some() {
                     cx.notify();
                 }
                 if !this.selecting && ev.pressed_button.is_none() {
@@ -2546,8 +2587,57 @@ impl Focusable for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScrollTarget, pages_to_lines, scroll_target};
+    use super::{LinkGesture, LinkTarget, ScrollTarget, link_gesture, pages_to_lines, scroll_target};
+    use crate::links;
     use serde_json::{Value, json};
+
+    #[test]
+    fn link_gesture_follows_the_platform_modifier_table() {
+        let held = |control, platform, shift, alt| Modifiers { control, platform, shift, alt, function: false };
+        let open_key = |shift| if cfg!(target_os = "macos") { held(false, true, shift, false) } else { held(true, false, shift, false) };
+        let other_key = |shift| if cfg!(target_os = "macos") { held(true, false, shift, false) } else { held(false, true, shift, false) };
+
+        assert_eq!(link_gesture(&open_key(false)), Some(LinkGesture::Open));
+        #[cfg(target_os = "macos")]
+        assert_eq!(link_gesture(&open_key(true)), Some(LinkGesture::Preview));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(link_gesture(&open_key(true)), None);
+
+        assert_eq!(link_gesture(&other_key(false)), None);
+        assert_eq!(link_gesture(&other_key(true)), None);
+        assert_eq!(link_gesture(&held(false, false, false, false)), None);
+        assert_eq!(link_gesture(&held(false, false, true, false)), None);
+
+        // Alt or Option cancels both gestures, and so does the other platform's key.
+        for shift in [false, true] {
+            let mut m = open_key(shift);
+            m.alt = true;
+            assert_eq!(link_gesture(&m), None);
+            let mut m = open_key(shift);
+            m.control = true;
+            m.platform = true;
+            assert_eq!(link_gesture(&m), None);
+        }
+    }
+
+    #[test]
+    fn open_gesture_accepts_every_target() {
+        for target in [
+            LinkTarget::External(links::Target::File("/tmp/a.txt".into())),
+            LinkTarget::External(links::Target::Url("https://example.com".into())),
+            LinkTarget::Terminal("w1.t1".into()),
+        ] {
+            assert!(LinkGesture::Open.accepts(&target), "{target:?}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn preview_gesture_accepts_only_files() {
+        assert!(LinkGesture::Preview.accepts(&LinkTarget::External(links::Target::File("/tmp/a.txt".into()))));
+        assert!(!LinkGesture::Preview.accepts(&LinkTarget::External(links::Target::Url("https://example.com".into()))));
+        assert!(!LinkGesture::Preview.accepts(&LinkTarget::Terminal("w1.t1".into())));
+    }
 
     #[test]
     fn output_turns_preserve_bytes_budget_and_close_order() {
