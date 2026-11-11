@@ -163,6 +163,8 @@ the highlighted line shows where it will land.
   Ctrl-click (Cmd-click on macOS) a live terminal address in terminal text to
   peek at it. Bare addresses refer to the machine of the terminal showing them;
   use `machine/address` for another machine. Names and non-live addresses aren't links.
+  On macOS, Cmd+Shift-click a file path in terminal text to preview it with
+  Quick Look; click the same file again to close the panel.
 - **Agent navigation order** belongs to the mods. A mod displaying agents calls
   `setAgentOrder(list.map(a => a.address))` on render so `agent.next` /
   `agent.prev` follow its list.
