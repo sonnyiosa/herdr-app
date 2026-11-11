@@ -2352,7 +2352,10 @@ impl Render for TerminalView {
                             return;
                         }
                         #[cfg(target_os = "macos")]
-                        (LinkGesture::Preview, LinkTarget::External(links::Target::File(_))) => {}
+                        (LinkGesture::Preview, LinkTarget::External(links::Target::File(path))) => {
+                            crate::quick_look::toggle(&path);
+                            return;
+                        }
                         #[cfg(target_os = "macos")]
                         (LinkGesture::Preview, _) => {}
                     }

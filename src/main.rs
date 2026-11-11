@@ -22,6 +22,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod macos_check;
 #[cfg(target_os = "macos")]
+mod quick_look;
+#[cfg(target_os = "macos")]
 mod quick_terminal;
 mod mods;
 mod mod_files;
