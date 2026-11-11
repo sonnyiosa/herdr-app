@@ -4959,7 +4959,7 @@ impl Render for AppWindow {
                     Err(error) => this.command_error("Key binding", &error, w, cx),
                 }
             }))
-            // Ctrl (Cmd) alone shows links in the pane under the pointer, focused or not.
+            // Ctrl (Cmd) shows links in the pane under the pointer, focused or not; Cmd+Shift shows files to preview.
             .on_modifiers_changed(cx.listener(|this, _: &ModifiersChangedEvent, _, cx| {
                 for t in this.terms.values() {
                     if t.view.read(cx).hovered() {

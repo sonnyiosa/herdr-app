@@ -51,13 +51,12 @@ pub fn toggle(path: &Path) {
     let Some(panel) = (unsafe { QLPreviewPanel::sharedPreviewPanel(mtm) }) else { return };
     SOURCE.with(|source| {
         let source = source.get_or_init(|| Source::new(mtm));
-        let mut shown = source.ivars().borrow_mut();
-        if panel.isVisible() && shown.as_deref() == Some(path) {
+        // No borrow is held across a panel call: the panel can ask the data source back.
+        if panel.isVisible() && source.ivars().borrow().as_deref() == Some(path) {
             panel.orderOut(None);
             return;
         }
-        *shown = Some(path.to_path_buf());
-        drop(shown);
+        source.ivars().replace(Some(path.to_path_buf()));
         // Nothing in Herdr's responder chain takes control of the panel, so the
         // data source set here stays through `updateController`.
         unsafe { panel.setDataSource(Some(ProtocolObject::from_ref(&**source))) };
