@@ -40,6 +40,13 @@ export default class PaneWindow {
       id: `pw-${id}`,
       fill: true,
       title: paneTitle(p),
+      extra: p?.terminal ? div().id(`pane-id-${id}`).relative().flex_none().px(u(3)).text_color(C.title).cursor_pointer().tooltip("Copy terminal address").on_click((_e, cx) => {
+        cx.stop_propagation();
+        cx.write_to_clipboard(p.terminal);
+        const copied = this.copied = { address: p.terminal };
+        cx.notify();
+        cx.timer.after(2000, (cx) => { if (this.copied === copied) { this.copied = null; cx.notify(); } });
+      }).child(this.copied?.address === p.terminal ? "Copied" : p.terminal) : null,
       active,
       icon: p?.mod ? icon(u, "programs", 16) : programIcon(u, p?.program, 16),
       controls: [

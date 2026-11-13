@@ -274,6 +274,7 @@ export function titleBar(u, o) {
         .text_color(active ? C.title : C.inactiveText)
         .child(o.title ?? ""),
     )
+    .when(Boolean(o.extra), el => el.child(o.extra))
     .child(div().relative().child(row));
   if (o.onDouble || o.onClick)
     bar = bar.on_click((e, cx) => {

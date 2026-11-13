@@ -182,7 +182,9 @@ shared `"workspace.panels"`, set by the welcome); a status bar,
 `workspace-status`), and as examples `terminals` ("Terminals": tabs in
 the title bar, panes as cards, a space picker) and `win98`
 ("Herdr 98": a whole desktop in one mod, `win98`). Add a layout by
-writing a new file. The Files panel supports Windows folder paths with spaces,
+writing a new file. In these layouts, click the terminal address chip in a pane
+header to copy its `hc` address. It shows `Copied` for two seconds after a click.
+Mod panes have no terminal address chip. The Files panel supports Windows folder paths with spaces,
 parentheses and apostrophes, and preserves Unicode file and folder names
 (including Chinese). Directory links expand as folders; their contents load
 only when expanded.

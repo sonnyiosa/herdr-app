@@ -9,6 +9,7 @@ This fork includes the following customizations:
 - **Quick Terminal:** Summon and hide a persistent terminal on macOS. See the [migration plan](docs/quick-terminal-plan.md), which records the original proposal and verification approach.
 - **Copy mode:** Navigate, search, and select terminal text with the keyboard. See the [copy mode specification](docs/copy-mode-spec.md).
 - **Quick Look:** Cmd+Shift-click a terminal file link to preview it on macOS. See the [Quick Look specification](docs/quick-look-spec.md).
+- **Terminal address chip:** Copy an `hc` terminal address from its pane's title bar. See the [terminal address specification](docs/terminal-address-chip.md).
 
 ## Install
 

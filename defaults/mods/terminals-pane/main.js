@@ -53,6 +53,13 @@ export default class TerminalsPane extends View {
         el.child(g.tint ? svg(g.icon).size(16).flex_none().text_color("#d6d8db") : image(g.icon).w(15).h(15).flex_none()),
       )
       .child(div().flex_none().max_w(320).truncate().font_semibold().text_color(p.focused ? "#e8e9eb" : "#a9adb3").child(title))
+      .when(Boolean(p.terminal), el => el.child(div().id(`pane-id-${pane}`).flex_none().px(6).rounded(4).bg("#ffffff0d").text_color("#e8e9eb").cursor_pointer().tooltip("Copy terminal address").on_click((_e, cx) => {
+        cx.stop_propagation();
+        cx.write_to_clipboard(p.terminal);
+        const copied = this.copied = { address: p.terminal };
+        cx.notify();
+        cx.timer.after(2000, (cx) => { if (this.copied === copied) { this.copied = null; cx.notify(); } });
+      }).child(this.copied?.address === p.terminal ? "Copied" : p.terminal)))
       .child(div().flex_1().truncate().text_color("#8b8f95").child(dir))
       .child(this.button(`th-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }))
       .child(this.button(`th-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }))
