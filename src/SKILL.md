@@ -22,6 +22,9 @@ its terminals.
 
 `app.check_updates` checks for newer releases. Pass `target: "app"` or `target: "core"` to check one; omit it to check both. Settings reports "Up to date"
 only after a successful check; on failure, check the connection and retry.
+Package-managed cores are checked but updated through their package manager.
+Dismiss a core update error with its × or `overlay.close {id:"core-update-error"}`;
+it stays dismissed until the error changes or the update recovers.
 
 On macOS, set `quick_terminal_shortcut` in settings.json to an opt-in
 system-wide shortcut such as `"ctrl-alt-space"` to toggle the quick terminal.
@@ -37,6 +40,13 @@ home directory. Exiting the terminal hides it; the next show starts a new sessio
 ## Show something when asked
 
 New spaces and tabs are shown immediately: only create them when asked.
+To start one the person will look at later without moving them there, pass
+`--focus false`:
+
+```sh
+herdr-app do space.new --name eng-123 --folder ~/code/app/eng-123 --argv '["claude"]' --task "Implement ENG-123" --focus false
+```
+
 Pick an explicit, useful name for every new space and tab; don't rely on
 default names. Use IDs from `ls` rather than guessing or acting on the wrong
 focused pane.
@@ -88,6 +98,23 @@ herdr-app do pane.swap '{"pane":"p12","target":"p14"}'
 
 `terminal.copy_mode` starts keyboard copy mode in the focused terminal; the default key is `ctrl-f enter`. Move with `h/j/k/l` or arrows, `0/^/$`, `w/b/e` (uppercase for whitespace-separated words), `{`/`}`, `g/G`, Ctrl-U/D/B/F or Page Up/Down. `v` or Space selects characters; `V` selects lines. `/` and `?` search, `n/N` repeat, `y` or Enter copies and exits, and `q` exits. Escape clears selection or search before exiting.
 
+`terminal.select_all {terminal?}` selects a terminal's whole screen and scrollback,
+ready for `terminal.copy`. Without a target it follows keyboard focus. In vim and
+other alternate-screen apps, it selects only that screen. Cmd+A runs it on macOS;
+Linux and Windows have no default, so Ctrl+A stays with the shell.
+
+`terminal.select {terminal?, at?: {row, col} | "cursor", mode?: "cell" | "word" | "line"}`
+replaces the selection, at the program cursor by default. Cells are zero-based; rows
+count from the oldest retained history through the active screen. Word and line
+match double/triple click. `terminal.adjust_selection {terminal?, direction}` moves
+the inclusive moving end and follows it in the view: left, right, up, down, page_up,
+page_down, home, end, line_start, line_end. It fails without a selection.
+`terminal.clear_selection {terminal?}` clears it; `terminal.copy` copies the focused terminal's selection.
+These commands add no default keys. Mods read the inclusive selection
+endpoints from `focused().selection` or `terminals()`; null means none (or no
+attached view). Use `selection.end` as a copy-mode cursor. Selection facts update
+when the selection changes, without refreshing readers on ordinary terminal output.
+
 `terminal.search` opens a find bar in the focused terminal. It searches that
 terminal's screen and scrollback; Enter and Shift-Enter move between matches,
 Escape closes the bar while its find field has focus, and each terminal keeps its own query (reopening selects it, so typing replaces it).
@@ -115,11 +142,24 @@ set). It is the installed guide to settings, layouts, commands and mods.
 Read the generated `.d.ts` files beside it for full API details; do not edit
 those files or the generated guide. The app rewrites them on start.
 
+- `terminal_line_height` (default 1, 0.8..2) adjusts terminal rows;
+  `terminal_cell_width` (default 1, 0.8..2) adjusts terminal columns;
+  `terminal_scroll_speed` (default 1, 0.1..5) adjusts wheel and trackpad
+  scrolling, including mouse reports. Set them in settings.json or the
+  layout's look; the layout wins.
 - Home defaults to `~/.config/herdr-app`; `HERDR_APP_HOME` selects another.
+- `worktrees.directory` in settings.json sets the shipped New worktree destination,
+  e.g. `{"worktrees":{"directory":"~/Developer/worktrees"}}`. Default:
+  `~/.herdr/worktrees`; checkouts use `<directory>/<repo>/<branch>` (slashes in
+  branches become dashes). Use an absolute path or `~` / `~/...`, resolved on the
+  space's machine. Read on dialog open; existing checkouts stay put. No clones
+  needed, and the app does not read the TUI's config.toml.
 - Mods live in `mods/<name>/` with `main.js` and optional `mod.json`.
   They are trusted JavaScript with command and network access.
   `"focusable": true` in `mod.json` lets `pane.go` move onto a copy; it receives
   `"focus"` from `nextCommand()` and focuses its own keyboard handle.
+- A mod's `watchFolder(dir)` promise has `cancel()`; cancel it when the folder
+  is no longer shown. It resolves with `[]` and releases only that call.
 - Shipped mods belong to Herdr: duplicate with `mod.clone` before editing.
   Shipped layouts likewise use `layout.clone` for a personal copy.
   Discover required arguments with `herdr-app commands`.
@@ -144,11 +184,14 @@ herdr-app shot /tmp/mod.png   # then look at the picture
 
 `check` loads the mod and renders it once. It exits nonzero with the exact
 error. Its shared state starts empty and stays in memory; it leaves shared.json
-untouched. Never call a mod done without a passing check. Then confirm it is
-shown correctly in the running window with `shot`; don't claim a visual
+untouched. Its `init()` still runs: import `checking` from `"herdr"` and guard
+process side effects with `if (checking()) return;`. It is true throughout a
+check and false in a live window; `exec`, `hc` and `writeTextFile` still run
+and warn during checks. Never call a mod done without a passing check.
+Then confirm it is shown correctly in the running window with `shot`; don't claim a visual
 check you haven't made.
 
-`herdr-app shot [file.png]` saves the window's last frame and prints its
+`herdr-app shot [file.png]` saves the window's current frame and prints its
 absolute path (default: `herdr-shot.png` in your current folder). It is the
 app's own rendering at full pixel size: terminals, images, overlays and
 floats included, even when the window is covered or minimized. No screen
