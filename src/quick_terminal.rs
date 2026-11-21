@@ -32,7 +32,6 @@ impl Global for QuickTerminalState {}
 
 struct QuickTerminal {
     core: Arc<Core>,
-    height: Rc<Cell<f32>>,
     terminal: Option<Entity<TerminalView>>,
     error: Option<String>,
     visible: Rc<Cell<bool>>,
@@ -46,7 +45,7 @@ struct QuickTerminal {
 }
 
 impl QuickTerminal {
-    fn new(core: Arc<Core>, height: f32, previous_app: Option<native::PreviousApp>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(core: Arc<Core>, previous_app: Option<native::PreviousApp>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         native::make_borderless(window);
         let visible = Rc::new(Cell::new(true));
         let dock_owned = Rc::new(Cell::new(false));
@@ -56,17 +55,17 @@ impl QuickTerminal {
         let close_animation = animation.clone();
         window.on_window_should_close(cx, move |window, cx| {
             close_visible.set(false);
-            native::set_visible(window, close_visible.clone(), close_dock_owned.clone(), close_animation.clone(), None, cx);
+            native::set_visible(window, close_dock_owned.clone(), close_animation.clone(), None, cx);
             false
         });
         let activation = cx.observe_window_activation(window, |this, window, cx| {
             if !window.is_window_active() && this.visible.replace(false) {
                 this.previous_app = None;
                 this.preserve_previous = false;
-                native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), None, cx);
+                native::set_visible(window, this.dock_owned.clone(), this.animation.clone(), None, cx);
             }
         });
-        let mut quick = Self { core, height: Rc::new(Cell::new(height)), terminal: None, error: None, visible, dock_owned, animation, previous_app, preserve_previous: false, _activation: activation, terminal_subscription: None, starting: false };
+        let mut quick = Self { core, terminal: None, error: None, visible, dock_owned, animation, previous_app, preserve_previous: false, _activation: activation, terminal_subscription: None, starting: false };
         quick.start(window, cx);
         quick
     }
@@ -108,7 +107,7 @@ impl QuickTerminal {
                                 this.terminal = None;
                                 this.terminal_subscription = None;
                                 if this.visible.replace(false) {
-                                    native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), None, cx);
+                                    native::set_visible(window, this.dock_owned.clone(), this.animation.clone(), None, cx);
                                 }
                                 cx.notify();
                             }
@@ -192,7 +191,7 @@ pub fn toggle(cx: &mut App) {
                         previous_app.activate();
                     }
                 }
-                native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), None, cx);
+                native::set_visible(window, this.dock_owned.clone(), this.animation.clone(), None, cx);
             } else {
                 let frontmost = native::PreviousApp::frontmost();
                 if frontmost.is_some() || !this.preserve_previous {
@@ -200,10 +199,7 @@ pub fn toggle(cx: &mut App) {
                 }
                 this.preserve_previous = false;
                 this.visible.set(true);
-                let pending = (this.height.get() != height)
-                    .then(|| window.display(cx).map(|d| (f32::from(d.bounds().size.height) * height, height, this.height.clone())))
-                    .flatten();
-                native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), pending, cx);
+                native::set_visible(window, this.dock_owned.clone(), this.animation.clone(), Some(height), cx);
                 if this.error.is_some() || this.terminal.is_none() {
                     this.start(window, cx);
                 }
@@ -227,11 +223,11 @@ pub fn toggle(cx: &mut App) {
         ..Default::default()
     };
     let previous_app = native::PreviousApp::frontmost();
-    match cx.open_window(options, |window, cx| cx.new(|cx| QuickTerminal::new(core, height, previous_app, window, cx))) {
+    match cx.open_window(options, |window, cx| cx.new(|cx| QuickTerminal::new(core, previous_app, window, cx))) {
         Ok(handle) => {
             cx.global_mut::<QuickTerminalState>().window = Some(handle);
             let _ = handle.update(cx, |this, window, cx| {
-                native::set_visible(window, this.visible.clone(), this.dock_owned.clone(), this.animation.clone(), None, cx);
+                native::set_visible(window, this.dock_owned.clone(), this.animation.clone(), this.visible.get().then_some(height), cx);
             });
         }
         Err(error) => tracing::error!("cannot open quick terminal: {error:#}"),
@@ -240,48 +236,73 @@ pub fn toggle(cx: &mut App) {
 
 mod native {
     use super::*;
+    use objc2::{msg_send, runtime::AnyObject};
+    use objc2_app_kit::NSScreen;
+    use objc2_foundation::{MainThreadMarker, NSNumber, NSRect, NSString};
 
     const AUTO_HIDE_DOCK: usize = 1;
     const HIDE_DOCK: usize = 1 << 1;
     const POP_UP_MENU_LEVEL: isize = 101;
     const DURATION: std::time::Duration = std::time::Duration::from_millis(200);
 
-    #[repr(C)]
     #[derive(Clone, Copy)]
-    struct Point { x: f64, y: f64 }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Size { width: f64, height: f64 }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Rect { origin: Point, size: Size }
+    struct Display {
+        id: Option<u32>,
+        frame: NSRect,
+        left_dock_inset: f64,
+    }
 
-    fn with_height(mut frame: Rect, height: f64) -> Rect {
-        frame.origin.y += frame.size.height - height;
-        frame.size.height = height;
-        frame
+    #[derive(Clone, Copy)]
+    struct Placement {
+        display_id: Option<u32>,
+        shown: NSRect,
+        left_dock_inset: f64,
+    }
+
+    fn placement_on(mut displays: impl Iterator<Item = Display>, previous: Option<Placement>, height: f32, dock_owned: bool) -> Option<Placement> {
+        let primary = displays.next()?;
+        let display = match previous.and_then(|placement| placement.display_id) {
+            Some(id) if primary.id != Some(id) => displays.find(|display| display.id == Some(id)).unwrap_or(primary),
+            _ => primary,
+        };
+        // Our auto-hide changes visibleFrame while a hide can still reverse.
+        let inset = previous
+            .filter(|placement| dock_owned && display.id.is_some() && placement.display_id == display.id)
+            .map_or(display.left_dock_inset, |placement| placement.left_dock_inset);
+        let mut shown = display.frame;
+        let terminal_height = shown.size.height * f64::from(height);
+        shown.origin.x += inset;
+        shown.origin.y += shown.size.height - terminal_height;
+        shown.size.width = (shown.size.width - inset).max(1.0);
+        shown.size.height = terminal_height;
+        Some(Placement { display_id: display.id, shown, left_dock_inset: inset })
+    }
+
+    fn current_placement(previous: Option<Placement>, height: f32, dock_owned: bool) -> Option<Placement> {
+        let marker = MainThreadMarker::new().expect("Quick Terminal runs on the main thread");
+        let screens = NSScreen::screens(marker);
+        let key = NSString::from_str("NSScreenNumber");
+        // AppKit lists the primary display first.
+        let displays = screens.iter().map(|screen| {
+            let id = screen.deviceDescription().objectForKey(&key)
+                .and_then(|value| value.downcast_ref::<NSNumber>().map(NSNumber::as_u32));
+            let frame = screen.frame();
+            let visible = screen.visibleFrame();
+            Display { id, frame, left_dock_inset: (visible.origin.x - frame.origin.x).max(0.0) }
+        });
+        placement_on(displays, previous, height, dock_owned)
+    }
+
+    fn hidden_frame(mut shown: NSRect) -> NSRect {
+        shown.origin.y += shown.size.height;
+        shown
     }
 
     #[derive(Default)]
     pub struct Animation {
         sequence: Cell<u64>,
-        frame: Cell<Option<Rect>>,
-        running: Cell<bool>,
+        placement: Cell<Option<Placement>>,
         initialized: Cell<bool>,
-    }
-
-    impl Animation {
-        fn apply_height(&self, sequence: u64, frame: Rect, height: Option<(f32, f32, Rc<Cell<f32>>)>) -> Rect {
-            if self.sequence.get() != sequence { return frame; }
-            if let Some((pixels, fraction, applied)) = height {
-                let frame = with_height(frame, f64::from(pixels));
-                self.frame.set(Some(frame));
-                applied.set(fraction);
-                frame
-            } else {
-                frame
-            }
-        }
     }
 
     #[link(name = "objc")]
@@ -289,8 +310,6 @@ mod native {
         fn sel_registerName(name: *const c_char) -> *const c_void;
         fn objc_getClass(name: *const c_char) -> *mut c_void;
         fn objc_msgSend();
-        #[cfg(target_arch = "x86_64")]
-        fn objc_msgSend_stret();
     }
 
     unsafe fn send_id(object: *mut c_void, selector: &[u8]) -> *mut c_void {
@@ -352,26 +371,11 @@ mod native {
         unsafe { set_style(window, sel_registerName(c"setStyleMask:".as_ptr()), 0); }
     }
 
-    unsafe fn rect(object: *mut c_void, name: *const c_char) -> Rect {
-        let selector = unsafe { sel_registerName(name) };
-        #[cfg(target_arch = "x86_64")]
-        {
-            let mut result = std::mem::MaybeUninit::<Rect>::uninit();
-            let f: unsafe extern "C" fn(*mut Rect, *mut c_void, *const c_void) = unsafe { std::mem::transmute(objc_msgSend_stret as *const ()) };
-            unsafe { f(result.as_mut_ptr(), object, selector); result.assume_init() }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let f: unsafe extern "C" fn(*mut c_void, *const c_void) -> Rect = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-            unsafe { f(object, selector) }
-        }
+    unsafe fn frame(window: *mut c_void) -> NSRect {
+        unsafe { msg_send![&*window.cast::<AnyObject>(), frame] }
     }
 
-    unsafe fn frame(window: *mut c_void) -> Rect {
-        unsafe { rect(window, c"frame".as_ptr()) }
-    }
-
-    unsafe fn set_frame(window: *mut c_void, frame: Rect, alpha: f64, animated: bool) {
+    unsafe fn set_frame(window: *mut c_void, frame: NSRect, alpha: f64, animated: bool) {
         unsafe {
             let context_class = objc_getClass(c"NSAnimationContext".as_ptr());
             if animated {
@@ -382,7 +386,7 @@ mod native {
                 duration(context, sel_registerName(c"setDuration:".as_ptr()), DURATION.as_secs_f64());
             }
             let target = if animated { send_id(window, b"animator\0") } else { window };
-            let set: unsafe extern "C" fn(*mut c_void, *const c_void, Rect, bool) = std::mem::transmute(objc_msgSend as *const ());
+            let set: unsafe extern "C" fn(*mut c_void, *const c_void, NSRect, bool) = std::mem::transmute(objc_msgSend as *const ());
             set(target, sel_registerName(c"setFrame:display:".as_ptr()), frame, true);
             let opacity: unsafe extern "C" fn(*mut c_void, *const c_void, f64) = std::mem::transmute(objc_msgSend as *const ());
             opacity(target, sel_registerName(c"setAlphaValue:".as_ptr()), alpha);
@@ -393,9 +397,9 @@ mod native {
         }
     }
 
-    pub fn set_visible(window: &Window, visible: Rc<Cell<bool>>, dock_owned: Rc<Cell<bool>>, animation: Rc<Animation>, height: Option<(f32, f32, Rc<Cell<f32>>)>, cx: &App) {
+    pub fn set_visible(window: &Window, dock_owned: Rc<Cell<bool>>, animation: Rc<Animation>, show_height: Option<f32>, cx: &App) {
         let Some(window) = ns_window(window) else { return };
-        let desired = visible.get();
+        let desired = show_height.is_some();
         let sequence = animation.sequence.get().wrapping_add(1);
         animation.sequence.set(sequence);
         let timer = cx.background_executor().timer(DURATION);
@@ -409,24 +413,14 @@ mod native {
                     let get_options: unsafe extern "C" fn(*mut c_void, *const c_void) -> usize = std::mem::transmute(objc_msgSend as *const ());
                     let set_options: unsafe extern "C" fn(*mut c_void, *const c_void, usize) = std::mem::transmute(objc_msgSend as *const ());
                     let options = get_options(app, sel_registerName(c"presentationOptions".as_ptr()));
-                    if desired {
-                        let screen = send_id(window, b"screen\0");
-                        if !screen.is_null() && !dock_owned.get() {
-                            let screen_frame = rect(screen, c"frame".as_ptr());
-                            let visible_frame = rect(screen, c"visibleFrame".as_ptr());
-                            let inset = (visible_frame.origin.x - screen_frame.origin.x).max(0.0);
-                            let mut target = animation.frame.get().unwrap_or_else(|| frame(window));
-                            target.origin.x = screen_frame.origin.x + inset;
-                            target.size.width = (screen_frame.size.width - inset).max(1.0);
-                            animation.frame.set(Some(target));
-                        }
-                    }
-                    if !animation.running.get() && (!desired || animation.frame.get().is_none()) {
-                        animation.frame.set(Some(frame(window)));
-                    }
-                    let frame = animation.frame.get().unwrap_or_else(|| frame(window));
-                    let frame = animation.apply_height(sequence, frame, height);
-                    let hidden = Rect { origin: Point { x: frame.origin.x, y: frame.origin.y + frame.size.height }, size: frame.size };
+                    let previous = animation.placement.get();
+                    let placement = show_height.and_then(|height| current_placement(previous, height, dock_owned.get()));
+                    let display_changed = placement.zip(previous)
+                        .is_some_and(|(current, previous)| current.display_id != previous.display_id);
+                    let placement = placement.or(previous);
+                    animation.placement.set(placement);
+                    let shown = placement.map_or_else(|| frame(window), |placement| placement.shown);
+                    let hidden = hidden_frame(shown);
                     if desired {
                         if options & (AUTO_HIDE_DOCK | HIDE_DOCK) == 0 {
                             set_options(app, sel_registerName(c"setPresentationOptions:".as_ptr()), options | AUTO_HIDE_DOCK);
@@ -436,22 +430,20 @@ mod native {
                         set_level(window, sel_registerName(c"setLevel:".as_ptr()), POP_UP_MENU_LEVEL);
                         let activate: unsafe extern "C" fn(*mut c_void, *const c_void, bool) = std::mem::transmute(objc_msgSend as *const ());
                         let is_visible: unsafe extern "C" fn(*mut c_void, *const c_void) -> bool = std::mem::transmute(objc_msgSend as *const ());
-                        if !animation.initialized.replace(true) || !is_visible(window, sel_registerName(c"isVisible".as_ptr())) {
+                        if !animation.initialized.replace(true) || display_changed || !is_visible(window, sel_registerName(c"isVisible".as_ptr())) {
                             set_frame(window, hidden, 0.0, false);
                         }
                         activate(app, sel_registerName(c"activateIgnoringOtherApps:".as_ptr()), true);
                         f(window, sel_registerName(c"makeKeyAndOrderFront:".as_ptr()), std::ptr::null_mut());
-                        set_frame(window, frame, 1.0, true);
+                        set_frame(window, shown, 1.0, true);
                     } else {
                         set_frame(window, hidden, 0.0, true);
                     }
-                    animation.running.set(true);
                 }
             }
             timer.await;
             unsafe {
                 if animation.sequence.get() == sequence {
-                    animation.running.set(false);
                     let is_key: unsafe extern "C" fn(*mut c_void, *const c_void) -> bool = std::mem::transmute(objc_msgSend as *const ());
                     if desired && !is_key(window, sel_registerName(c"isKeyWindow".as_ptr())) {
                         // App activation completes after makeKeyAndOrderFront: and can give key status back to another window.
@@ -478,30 +470,45 @@ mod native {
 
     #[cfg(test)]
     mod tests {
-        use super::{Animation, Cell, Point, Rc, Rect, Size, with_height};
+        use super::{Display, hidden_frame, placement_on};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+        const PRIMARY: Display = Display {
+            id: Some(1),
+            frame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)),
+            left_dock_inset: 48.0,
+        };
+        const EXTERNAL: Display = Display {
+            id: Some(2),
+            frame: NSRect::new(NSPoint::new(-1920.0, 100.0), NSSize::new(1920.0, 1200.0)),
+            left_dock_inset: 0.0,
+        };
 
         #[test]
-        fn height_change_keeps_the_top_edge_fixed() {
-            let original = Rect { origin: Point { x: 20.0, y: 500.0 }, size: Size { width: 900.0, height: 500.0 } };
-            let changed = with_height(original, 750.0);
-            assert_eq!(changed.origin.y, 250.0);
-            assert_eq!(changed.size.height, 750.0);
-            assert_eq!(changed.origin.x, 20.0);
-            assert_eq!(changed.size.width, 900.0);
+        fn show_uses_current_geometry_of_the_last_connected_display() {
+            let previous = placement_on([EXTERNAL].into_iter(), None, 0.5, false);
+            let moved = Display {
+                frame: NSRect::new(NSPoint::new(1440.0, -100.0), NSSize::new(1600.0, 1000.0)),
+                ..EXTERNAL
+            };
+            let placement = placement_on([PRIMARY, moved].into_iter(), previous, 0.75, false).unwrap();
+            assert_eq!(placement.shown, NSRect::new(NSPoint::new(1440.0, 150.0), NSSize::new(1600.0, 750.0)));
         }
 
         #[test]
-        fn superseded_show_keeps_height_change_pending() {
-            let animation = Animation::default();
-            let applied = Rc::new(Cell::new(0.5));
-            let frame = Rect { origin: Point { x: 0.0, y: 500.0 }, size: Size { width: 900.0, height: 500.0 } };
-            animation.sequence.set(2);
-            let unchanged = animation.apply_height(1, frame, Some((750.0, 0.75, applied.clone())));
-            assert_eq!(unchanged.size.height, 500.0);
-            assert_eq!(applied.get(), 0.5);
-            let changed = animation.apply_height(2, frame, Some((750.0, 0.75, applied.clone())));
-            assert_eq!(changed.size.height, 750.0);
-            assert_eq!(applied.get(), 0.75);
+        fn show_fits_the_primary_display_after_disconnect() {
+            let previous = placement_on([EXTERNAL].into_iter(), None, 0.5, false);
+            let placement = placement_on([PRIMARY].into_iter(), previous, 0.5, false).unwrap();
+            assert_eq!(placement.shown, NSRect::new(NSPoint::new(48.0, 450.0), NSSize::new(1392.0, 450.0)));
+            assert_eq!(hidden_frame(placement.shown), NSRect::new(NSPoint::new(48.0, 900.0), NSSize::new(1392.0, 450.0)));
+        }
+
+        #[test]
+        fn reversing_a_hide_preserves_the_left_dock_inset() {
+            let previous = placement_on([PRIMARY].into_iter(), None, 0.5, false).unwrap();
+            let dock_hidden = Display { left_dock_inset: 0.0, ..PRIMARY };
+            let placement = placement_on([dock_hidden].into_iter(), Some(previous), 0.5, true).unwrap();
+            assert_eq!(placement.shown, previous.shown);
         }
     }
 }

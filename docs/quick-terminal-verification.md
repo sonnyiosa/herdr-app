@@ -1,6 +1,6 @@
 # Verify the quick terminal
 
-Use this method before merging a quick terminal implementation. The feature does not exist yet, so the expected results below are acceptance criteria, not results already observed. Record the commit, platform, display server, shortcut, and test result for every run. Keep screenshots, a video, and command output outside the sandbox directory so teardown does not remove the evidence.
+Use this method to verify changes to Quick Terminal. Record the commit, platform, display server, shortcut, and test result for every run. Keep screenshots, a video, and command output outside the sandbox directory so teardown does not remove the evidence.
 
 ## Prepare an isolated run
 
@@ -20,6 +20,7 @@ Run each case on the actual platform. Capture the action and result. A command r
 6. Close or exit the quick terminal's process. Verify that the resulting window state matches the documented policy and that another toggle can recover. Restart Herdr with the isolated home and check the documented persistence policy.
 7. Check the main window before and after toggling, including its placement, selected layout, and existing key bindings. Check a second display and a different macOS Space or Linux compositor where available. Record unsupported compositor behavior as a limitation, not a pass.
 8. Run `just test` and `just check` for the implementation. Verify existing user settings and edited key files survive an upgrade. Review `defaults/AGENTS.md` and `src/SKILL.md` against any new commands or settings.
+9. On macOS, make a taller external display the primary display. Open Quick Terminal, start a process that prints a marker, and hide the terminal. Disconnect the external display and press the shortcut once. Verify that Quick Terminal opens at the top of the built-in display at the configured height, with its top row visible and the same process running.
 
 ## Distinguish the test surfaces
 

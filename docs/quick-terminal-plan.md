@@ -2,6 +2,12 @@
 
 Give users a terminal they can summon and hide without losing its session. Start with macOS as the proposed first platform and validate the other platforms before promising parity. Keep the feature opt-in, including its system-wide shortcut. Obtain Can's approval for any additions to the app core or requests to herdr-core before implementation.
 
+## macOS display placement
+
+Quick Terminal opens at the top of the primary display the first time. On later shows, it returns to its last display if that display is still connected. If the display was disconnected, Quick Terminal opens on the current primary display. Its height uses the current display size and the configured `quick_terminal_height` fraction each time it opens.
+
+See the [verification procedure](quick-terminal-verification.md) for the display disconnect case.
+
 ## Build verification first
 
 - [ ] Use `docs/quick-terminal-verification.md` as the acceptance method and run `scripts/quick-terminal-verify-preflight` on the Linux test host.
