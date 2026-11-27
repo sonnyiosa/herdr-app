@@ -806,15 +806,25 @@ export default class Settings extends View {
             : u.checks
               ? [result("core"), check("st-check-core", "core")]
               : ["Not checked: a build from source looks for no updates.", null];
-    const auto = u.auto;
+    if (this.autoPending && !this.autoPending.saving && u.auto === this.autoPending.value) this.autoPending = null;
+    const auto = this.autoPending?.value ?? u.auto;
     return v_flex()
       .w_full()
       .child(this.heading(t, "Automatic updates"))
       .child(this.row(t, "Check for updates automatically", "Herdr looks every hour and downloads what it finds. Off: it only looks when you press Check now.", this.toggle(t, "st-auto-update", auto, (_e, cx) =>
-        this.change((p) => {
-          if (auto) p.auto_update = false;
-          else delete p.auto_update;
-        }, cx))))
+        {
+          if (this.autoPending) return;
+          this.autoPending = { value: !auto, saving: true };
+          cx.notify();
+          cx.spawn(async (cx) => {
+            const failed = await this.save((p) => { p.auto_update = !auto; });
+            if (failed) {
+              this.autoPending = null;
+              notify({ ...failed, level: "error" });
+            } else this.autoPending.saving = false;
+            cx.notify();
+          });
+        })))
       .child(div().h(18))
       .child(this.heading(t, "Herdr"))
       .child(this.row(t, `Herdr ${u.app.version}`, app[0], h_flex().gap(8).flex_none()

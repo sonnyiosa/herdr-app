@@ -103,7 +103,7 @@ static CORE_CHECKED: Mutex<Option<u64>> = Mutex::new(None);
 /// The checker runs (a release, or pointed at a test server), and is looking right now.
 /// settings.json's `auto_update`: off stops the hourly looks (and downloads);
 /// "Check now" still works.
-static AUTO: AtomicBool = AtomicBool::new(true);
+static AUTO: AtomicBool = AtomicBool::new(false);
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static CHECKING: AtomicBool = AtomicBool::new(false);
 

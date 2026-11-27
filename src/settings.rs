@@ -401,7 +401,7 @@ pub struct Person {
     /// Anonymous usage data (telemetry.rs). On unless set to false.
     #[serde(skip_serializing_if = "is_true")]
     pub telemetry: bool,
-    /// Look for and download app updates (update.rs). On unless set to false.
+    /// Look for and download app updates (update.rs). Off unless set to true.
     #[serde(skip_serializing_if = "is_true")]
     pub auto_update: bool,
     /// Allow terminal programs (including remote ones) to copy text locally.
@@ -480,7 +480,7 @@ impl Default for Person {
             terminal_scroll_speed: 1.0,
             ui_font: None,
             telemetry: true,
-            auto_update: true,
+            auto_update: false,
             clipboard_write: true,
             copy_on_select: true,
             pane_scrollbars: true,
@@ -490,6 +490,14 @@ impl Default for Person {
             theme: None,
             colors: BTreeMap::new(),
         }
+    }
+}
+
+#[test]
+fn automatic_updates_are_opt_in() {
+    for (json, expected) in [("{}", false), (r#"{"auto_update":true}"#, true), (r#"{"auto_update":false}"#, false)] {
+        let person = serde_json::from_str::<Person>(json).unwrap();
+        assert_eq!(auto_update_setting(&Ok(person)), expected);
     }
 }
 
@@ -737,20 +745,20 @@ fn validate_person(person: Person) -> Result<Person, String> {
 /// The value of settings.json's own `telemetry`, read even when the file has
 /// another problem: an explicit `false` always counts.
 pub fn telemetry_setting(person: &Result<Person, String>) -> bool {
-    flag_setting(person, "telemetry", |p| p.telemetry)
+    flag_setting(person, "telemetry", true, |p| p.telemetry)
 }
 
 /// Same for `auto_update`.
 pub fn auto_update_setting(person: &Result<Person, String>) -> bool {
-    flag_setting(person, "auto_update", |p| p.auto_update)
+    flag_setting(person, "auto_update", false, |p| p.auto_update)
 }
 
-fn flag_setting(person: &Result<Person, String>, key: &str, get: fn(&Person) -> bool) -> bool {
+fn flag_setting(person: &Result<Person, String>, key: &str, default: bool, get: fn(&Person) -> bool) -> bool {
     match person {
         Ok(p) => get(p),
         Err(_) => {
             let raw = std::fs::read_to_string(path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
-            raw.and_then(|v| v.get(key).and_then(serde_json::Value::as_bool)).unwrap_or(true)
+            raw.and_then(|v| v.get(key).and_then(serde_json::Value::as_bool)).unwrap_or(default)
         }
     }
 }

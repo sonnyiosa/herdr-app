@@ -20,6 +20,10 @@ const values: Record<string, any> = {
     disk.raw = text;
   },
 };
+const element: any = new Proxy({}, { get: () => (..._args: unknown[]) => element });
+let auto = false;
+values.v_flex = values.h_flex = values.div = () => element;
+values.updates = () => ({ auto, checks: false, app: { updates: false, version: "1" }, core: {} });
 const names = [...source.matchAll(/^import \{([^}]*)\}/gm)].flatMap(m => m[1].split(",").map(n => n.trim()));
 const args = names.map(name => values[name] ?? (() => undefined));
 const Settings = new Function(...names, source.replace(/^import .*;\n/gm, "").replace("export default class Settings", "return class Settings"))(...args);
@@ -73,4 +77,48 @@ test("a settings.json that can't be read, or an edit that throws, says why", asy
   const thrown = await change("{}", () => { throw new Error("no such section"); });
   expect(disk.writes).toBe(0);
   expect(thrown.toasts).toEqual([{ title: "Cannot read settings.json", body: "no such section", level: "error" }]);
+});
+
+test("automatic updates respond before saving and retain an explicit choice", async () => {
+  Object.assign(disk, { raw: "{}", writes: 0, fail: undefined, readFail: undefined, toasts: [] });
+  auto = false;
+  const view = new Settings();
+  view.heading = view.row = view.button = () => element;
+  let shown = false;
+  let click: (_event: unknown, cx: unknown) => void = () => {};
+  view.toggle = (_theme: unknown, _id: unknown, on: boolean, handler: typeof click) => { shown = on; click = handler; return element; };
+  let finished: Promise<void> = Promise.resolve();
+  const cx = { notify: () => {}, spawn: (f: (cx: unknown) => Promise<void>) => { finished = f(cx); } };
+  view.updates({});
+  expect(shown).toBe(false);
+  click(null, cx);
+  view.updates({});
+  expect(shown).toBe(true);
+  await finished;
+  expect(JSON.parse(disk.raw!)).toEqual({ auto_update: true });
+  auto = true;
+  view.updates({});
+  click(null, cx);
+  await finished;
+  expect(JSON.parse(disk.raw!)).toEqual({ auto_update: false });
+});
+
+test("automatic update switch reverts when saving fails", async () => {
+  Object.assign(disk, { raw: "{}", writes: 0, fail: "read-only", readFail: undefined, toasts: [] });
+  auto = false;
+  const view = new Settings();
+  view.heading = view.row = view.button = () => element;
+  let shown = false;
+  let click: (_event: unknown, cx: unknown) => void = () => {};
+  view.toggle = (_theme: unknown, _id: unknown, on: boolean, handler: typeof click) => { shown = on; click = handler; return element; };
+  let finished: Promise<void> = Promise.resolve();
+  const cx = { notify: () => {}, spawn: (f: (cx: unknown) => Promise<void>) => { finished = f(cx); } };
+  view.updates({});
+  click(null, cx);
+  view.updates({});
+  expect(shown).toBe(true);
+  await finished;
+  view.updates({});
+  expect(shown).toBe(false);
+  expect(disk.toasts[0].title).toBe("Not saved to settings.json");
 });
