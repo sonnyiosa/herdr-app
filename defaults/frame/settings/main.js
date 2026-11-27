@@ -42,7 +42,7 @@ export default class Settings extends View {
       const edit = this.machineEdit;
       if (edit?.action === "rename") this.machineAction(edit.machine, "rename", cx, edit.name);
     });
-    this.person = {};
+    this.person = { auto_update: updates().auto };
     this.raw = null;
     this.previews = {}; // layout name -> its "preview" picture
     this.previewsOf = "";
@@ -806,25 +806,26 @@ export default class Settings extends View {
             : u.checks
               ? [result("core"), check("st-check-core", "core")]
               : ["Not checked: a build from source looks for no updates.", null];
-    if (this.autoPending && !this.autoPending.saving && u.auto === this.autoPending.value) this.autoPending = null;
-    const auto = this.autoPending?.value ?? u.auto;
+    const auto = this.autoPending ?? (this.person.auto_update === true);
     return v_flex()
       .w_full()
       .child(this.heading(t, "Automatic updates"))
-      .child(this.row(t, "Check for updates automatically", "Herdr looks every hour and downloads what it finds. Off: it only looks when you press Check now.", this.toggle(t, "st-auto-update", auto, (_e, cx) =>
-        {
-          if (this.autoPending) return;
-          this.autoPending = { value: !auto, saving: true };
+      .child(this.row(t, "Check for updates automatically", "Herdr looks every hour and downloads what it finds. Off: it only looks when you press Check now.", this.toggle(t, "st-auto-update", auto, (_e, cx) => {
+        const pending = this.autoPending;
+        this.autoPending = !(pending ?? (this.person.auto_update === true));
+        cx.notify();
+        if (pending !== undefined) return;
+        cx.spawn(async (cx) => {
+          while (this.autoPending !== undefined) {
+            const value = this.autoPending;
+            const failed = await this.save((p) => { p.auto_update = value; });
+            if (this.autoPending !== value) continue;
+            this.autoPending = undefined;
+            if (failed) notify({ ...failed, level: "error" });
+          }
           cx.notify();
-          cx.spawn(async (cx) => {
-            const failed = await this.save((p) => { p.auto_update = !auto; });
-            if (failed) {
-              this.autoPending = null;
-              notify({ ...failed, level: "error" });
-            } else this.autoPending.saving = false;
-            cx.notify();
-          });
-        })))
+        });
+      })))
       .child(div().h(18))
       .child(this.heading(t, "Herdr"))
       .child(this.row(t, `Herdr ${u.app.version}`, app[0], h_flex().gap(8).flex_none()

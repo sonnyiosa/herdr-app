@@ -21,9 +21,8 @@ const values: Record<string, any> = {
   },
 };
 const element: any = new Proxy({}, { get: () => (..._args: unknown[]) => element });
-let auto = false;
 values.v_flex = values.h_flex = values.div = () => element;
-values.updates = () => ({ auto, checks: false, app: { updates: false, version: "1" }, core: {} });
+values.updates = () => ({ auto: false, checks: false, app: { updates: false, version: "1" }, core: {} });
 const names = [...source.matchAll(/^import \{([^}]*)\}/gm)].flatMap(m => m[1].split(",").map(n => n.trim()));
 const args = names.map(name => values[name] ?? (() => undefined));
 const Settings = new Function(...names, source.replace(/^import .*;\n/gm, "").replace("export default class Settings", "return class Settings"))(...args);
@@ -79,10 +78,10 @@ test("a settings.json that can't be read, or an edit that throws, says why", asy
   expect(thrown.toasts).toEqual([{ title: "Cannot read settings.json", body: "no such section", level: "error" }]);
 });
 
-test("automatic updates respond before saving and retain an explicit choice", async () => {
+test("automatic updates accept taps while saving and while updater status is stale", async () => {
   Object.assign(disk, { raw: "{}", writes: 0, fail: undefined, readFail: undefined, toasts: [] });
-  auto = false;
   const view = new Settings();
+  await view.load();
   view.heading = view.row = view.button = () => element;
   let shown = false;
   let click: (_event: unknown, cx: unknown) => void = () => {};
@@ -94,19 +93,29 @@ test("automatic updates respond before saving and retain an explicit choice", as
   click(null, cx);
   view.updates({});
   expect(shown).toBe(true);
+  click(null, cx);
+  view.updates({});
+  expect(shown).toBe(false);
   await finished;
-  expect(JSON.parse(disk.raw!)).toEqual({ auto_update: true });
-  auto = true;
+  expect(JSON.parse(disk.raw!)).toEqual({ auto_update: false });
+
   view.updates({});
   click(null, cx);
+  await finished;
+  expect(JSON.parse(disk.raw!)).toEqual({ auto_update: true });
+  view.updates({});
+  expect(shown).toBe(true);
+  click(null, cx);
+  view.updates({});
+  expect(shown).toBe(false);
   await finished;
   expect(JSON.parse(disk.raw!)).toEqual({ auto_update: false });
 });
 
 test("automatic update switch reverts when saving fails", async () => {
   Object.assign(disk, { raw: "{}", writes: 0, fail: "read-only", readFail: undefined, toasts: [] });
-  auto = false;
   const view = new Settings();
+  await view.load();
   view.heading = view.row = view.button = () => element;
   let shown = false;
   let click: (_event: unknown, cx: unknown) => void = () => {};
