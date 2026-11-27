@@ -129,7 +129,7 @@ impl QuickTerminal {
 impl Render for QuickTerminal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full().key_context("Herdr").bg(crate::settings::color("background"))
-            .on_action(cx.listener(|this, action: &gpui_shell::action::ShellAction, window, cx| {
+            .on_action(cx.listener(|this, action: &herdr_shell::action::ShellAction, window, cx| {
                 let Some(terminal) = &this.terminal else { cx.propagate(); return };
                 match action.id() {
                     "terminal.copy" => {

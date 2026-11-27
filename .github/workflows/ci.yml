@@ -67,7 +67,11 @@ jobs:
       # Compile the screenshot harness before running tests.
       # Disable optimized dev dependencies in CI to reduce test compile time.
       - name: Build tests
-        run: cargo test --locked --config 'profile.dev.package."*".opt-level=0' --no-run
+        run: |
+          cargo test --locked -p herdr-app \
+            --config 'profile.dev.package."*".opt-level=0' \
+            --config 'profile.dev.package.herdr-shell.opt-level=0' \
+            --no-run
       - name: Note the sources the cache was built from
         if: env.SAVE_CACHES == 'true' && steps.cache.outputs.cache-hit != 'true'
         run: scripts/ci-sources record
@@ -84,13 +88,20 @@ jobs:
             name=$(basename "$t" .rs)
             [ "$name" = shot_pixels ] || only+=(--test "$name")
           done
-          cargo test --locked --config 'profile.dev.package."*".opt-level=0' "${only[@]}" --bins
+          cargo test --locked -p herdr-app \
+            --config 'profile.dev.package."*".opt-level=0' \
+            --config 'profile.dev.package.herdr-shell.opt-level=0' \
+            "${only[@]}" --bins
       # Exercise the native window renderer separately.
       - name: Screenshot pixels
         timeout-minutes: 5
         env:
           HERDR_SHOT_NATIVE_TEST: "1"
-        run: cargo test --locked --config 'profile.dev.package."*".opt-level=0' --test shot_pixels
+        run: |
+          cargo test --locked -p herdr-app \
+            --config 'profile.dev.package."*".opt-level=0' \
+            --config 'profile.dev.package.herdr-shell.opt-level=0' \
+            --test shot_pixels
 
   # Keep the required check name stable.
   test:
